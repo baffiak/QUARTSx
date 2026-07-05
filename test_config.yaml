@@ -1,37 +1,40 @@
 project: TestSS3
-out_dir: /Users/pavel/zUMIs/QUARTSx/testdata/run
+out_dir: testdata/run
 star_tmp: /tmp/quartsx_star_tmp
 num_threads: 4
 mem_limit: 8
 
+# Paths are relative to the repo root — run this from the directory that
+# contains quartsx.sh (e.g. `cd QUARTSx && ./quartsx.sh -y test_config.yaml`).
+
 sequence_files:
   file1:
-    name: /Users/pavel/zUMIs/QUARTSx/testdata/R1.fastq.gz
+    name: testdata/R1.fastq.gz
     base_definition:
       - cDNA(25-150)
       - UMI(12-19)
     find_pattern: "ATTGCGCAATG;1"
   file2:
-    name: /Users/pavel/zUMIs/QUARTSx/testdata/R2.fastq.gz
+    name: testdata/R2.fastq.gz
     base_definition:
       - cDNA(1-150)
   file3:
-    name: /Users/pavel/zUMIs/QUARTSx/testdata/I1.fastq.gz
+    name: testdata/I1.fastq.gz
     base_definition:
       - BC(1-10)
   file4:
-    name: /Users/pavel/zUMIs/QUARTSx/testdata/I2.fastq.gz
+    name: testdata/I2.fastq.gz
     base_definition:
       - BC(1-10)
 
 reference:
-  STAR_index: /Users/pavel/zUMIs/QUARTSx/testdata/STARidx
-  GTF_file: /Users/pavel/zUMIs/QUARTSx/testdata/annot.gtf
+  STAR_index: testdata/STARidx
+  GTF_file: testdata/annot.gtf
   additional_files: null
   additional_STAR_params: "--limitBAMsortRAM 2000000000"   # STAR under-reads RAM on Rosetta; cap the BAM-sort buffer
 
 read_filtering:
-  adapter_fasta: /Users/pavel/zUMIs/QUARTSx/SmartSeq3xpressAdapter.fa
+  adapter_fasta: SmartSeq3xpressAdapter.fa
   quality: 20
   min_length: 20
 
@@ -44,7 +47,7 @@ filter_cutoffs:
     phred: 20
 
 barcodes:
-  index_table: /Users/pavel/zUMIs/QUARTSx/testdata/cells_96.csv
+  index_table: testdata/cells_96.csv
   BarcodeBinning: 2
   nReadsperCell: 10
 
