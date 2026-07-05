@@ -28,9 +28,9 @@ Concretely, QUARTSx keeps from zUMIs:
   (`umicount` / `readcount` / `readcount_internal` × `exon` / `inex` / `intron`).
 
 The fixed SS3xpress read layout is assumed throughout: **R1** = TSO tag + UMI + 5′ cDNA,
-**R2** = internal cDNA, **I1 + I2** = 10 + 10 bp dual sample index → cell barcode. Reads whose
+**R2** = internal cDNA, **I1 + I2** = dual sample index → cell barcode. Reads whose
 R1 matches the TSO tag (fixed-position, within a mismatch budget) are *tagged* and carry an
-8 bp UMI; the rest are *internal* (untagged, tiled across the transcript by tagmentation).
+UMI; the rest are *internal* (untagged, tiled across the transcript by tagmentation).
 
 ## What is different (and why)
 
@@ -53,7 +53,7 @@ its true parent, so errors radiating from a highly amplified UMI collapse into i
 independently abundant UMIs one base apart stay separate. This reduces both the over-counting
 of blind distinct-UMI counting and the under-counting of blind one-mismatch merging.
 
-**Honesty note.** zUMIs does *not* use directional. Its default is plain distinct-UMI counting,
+**Note.** zUMIs does *not* use directional. Its default is plain distinct-UMI counting,
 and its optional collapse (`hammingFilter`) is a frequency-based Hamming merge closer to
 UMI-tools *adjacency*. QUARTSx's UMI counts are therefore a principled upgrade to the
 field-standard directional method — **not** numerically identical to zUMIs. Directional is
@@ -76,7 +76,7 @@ is auto-detected from the first reads, because i5 is read in either orientation 
 instrument.
 
 Note this is a structurally different barcode model from zUMIs (dual i7/i5 index table, not a
-single 20 bp whitelist), so the blanket "same as zUMIs" promise does not extend to how a read is
+single whitelist), so the blanket "same as zUMIs" promise does not extend to how a read is
 assigned to a cell — by design.
 
 ### Counting model: reproduces zUMIs
@@ -102,7 +102,7 @@ Recommended: create the environment with conda from `env.yaml` (channels conda-f
 then activate it and work inside it.
 
 ```bash
-git clone https://github.com/<user>/QUARTSx.git      # maintainer repo
+git clone https://github.com/baffiak/QUARTSx.git
 cd QUARTSx
 conda env create -n quartsx -f env.yaml
 conda activate quartsx
@@ -110,8 +110,7 @@ conda activate quartsx
 
 `env.yaml` records the exact combination QUARTSx was tested with. Treat it as a worked example of a
 setup that runs, not a promise that future package versions will keep working — bioinformatics tools
-change behaviour between releases (a newer samtools once broke zUMIs; STAR 2.7.11 does not work on
-macOS).
+change behaviour between releases.
 
 QUARTSx is compiled from source: `quartsx.sh` runs `cargo build --release` once on the first run and
 reuses the binary afterwards — which is why the build output (`target/`) is not shipped. Building
@@ -138,12 +137,11 @@ work:
 | r-svglite | 2.2.2 | QC plots (SVG) |
 | r-yaml | 2.3.12 | config parsing |
 
-Use STAR 2.7.10b: the bundled `testdata/` index was built with it and STAR 2.7.11 is known not to
-work on macOS. For your own data you build your own index with whatever STAR you run.
+Use STAR 2.7.10b: the bundled `testdata/` index was built with it.
 
 The table lists only the packages the pipeline calls directly. The complete resolved environment —
 every package and exact version of a validated install — is in `env.tested.txt` (a `conda list`
-dump), the conda equivalent of an R `sessionInfo()`.
+dump).
 
 ## Test
 
