@@ -1,0 +1,8 @@
+# Rust build output — quartsx.sh compiles this on first run; never committed
+/target/
+
+# obsolete design note — superseded by README.md
+SPEC.md
+
+# OS cruft
+.DS_Store

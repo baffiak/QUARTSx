@@ -1,0 +1,68 @@
+STAR version=2.7.10b
+STAR compilation time,server,dir= :/Users/distiller/project/STARcompile/source
+STAR git: On branch master ; commit c6f8efc2c7043ef83bf8b0d9bed36bbb6b9b1133 ; diff files: 
+##### Command Line:
+STAR --runMode genomeGenerate --genomeDir STARidx --genomeFastaFiles genome.fa --genomeSAindexNbases 5 --genomeChrBinNbits 11 --runThreadN 4 --outTmpDir /tmp/quartsx_gg_tmp
+##### Initial USER parameters from Command Line:
+outTmpDir                         /tmp/quartsx_gg_tmp
+###### All USER parameters from Command Line:
+runMode                       genomeGenerate        ~RE-DEFINED
+genomeDir                     STARidx     ~RE-DEFINED
+genomeFastaFiles              genome.fa        ~RE-DEFINED
+genomeSAindexNbases           5     ~RE-DEFINED
+genomeChrBinNbits             11     ~RE-DEFINED
+runThreadN                    4     ~RE-DEFINED
+outTmpDir                     /tmp/quartsx_gg_tmp     ~RE-DEFINED
+##### Finished reading parameters from all sources
+
+##### Final user re-defined parameters-----------------:
+runMode                           genomeGenerate   
+runThreadN                        4
+genomeDir                         STARidx
+genomeFastaFiles                  genome.fa   
+genomeSAindexNbases               5
+genomeChrBinNbits                 11
+outTmpDir                         /tmp/quartsx_gg_tmp
+
+-------------------------------
+##### Final effective command line:
+STAR   --runMode genomeGenerate      --runThreadN 4   --genomeDir STARidx   --genomeFastaFiles genome.fa      --genomeSAindexNbases 5   --genomeChrBinNbits 11   --outTmpDir /tmp/quartsx_gg_tmp
+----------------------------------------
+
+Number of fastq files for each mate = 1
+ParametersSolo: --soloCellFilterType CellRanger2.2 filtering parameters:  3000 0.99 10
+Finished loading and checking parameters
+--genomeDir directory exists and will be overwritten: STARidx/
+Jul 05 19:21:32 ... starting to generate Genome files
+genome.fa : chr # 0  "chr1" chrStart: 0
+genome.fa : chr # 1  "chr2" chrStart: 10240
+Chromosome sequence lengths: 
+chr1	9000
+chr2	7000
+Genome sequence total length = 16000
+Genome size with padding = 18432
+Estimated genome size with padding and SJs: total=genome+SJ=201018432 = 18432 + 201000000
+GstrandBit=32
+Number of SA indices: 32000
+Jul 05 19:21:32 ... starting to sort Suffix Array. This may take a long time...
+Number of chunks: 4;   chunks size limit: 85328 bytes
+Jul 05 19:21:32 ... sorting Suffix Array chunks and saving them to disk...
+Writing 1080 bytes into STARidx//SA_3 ; empty space on disk = 75863572873216 bytes ... done
+Writing 85312 bytes into STARidx//SA_0 ; empty space on disk = 75863571824640 bytes ...Writing 84864 bytes into STARidx//SA_2 ; empty space on disk = 75863549804544 bytes ...Writing 84864 bytes into STARidx//SA_2 ; empty space on disk = 75863549804544 bytes ... done
+ done
+Writing 84744 bytes into STARidx//SA_1 ; empty space on disk = 75863527784448 bytes ... done
+Jul 05 19:21:32 ... loading chunks from disk, packing SA...
+Jul 05 19:21:32 ... finished generating suffix array
+Jul 05 19:21:32 ... generating Suffix Array index
+Jul 05 19:21:32 ... completed Suffix Array index
+Jul 05 19:21:32 ... writing Genome to disk ...
+Writing 18432 bytes into STARidx//Genome ; empty space on disk = 75863571824640 bytes ... done
+SA size in bytes: 132003
+Jul 05 19:21:32 ... writing Suffix Array to disk ...
+Writing 132003 bytes into STARidx//SA ; empty space on disk = 75863566581760 bytes ... done
+Jul 05 19:21:32 ... writing SAindex to disk
+Writing 8 bytes into STARidx//SAindex ; empty space on disk = 75863531978752 bytes ... done
+Writing 48 bytes into STARidx//SAindex ; empty space on disk = 75863531978752 bytes ... done
+Writing 5971 bytes into STARidx//SAindex ; empty space on disk = 75863531978752 bytes ... done
+Jul 05 19:21:32 ..... finished successfully
+DONE: Genome generation, EXITING
