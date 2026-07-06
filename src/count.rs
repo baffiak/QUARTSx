@@ -4,6 +4,7 @@ use crate::gtf::{Annotation, Gene, Tree};
 use anyhow::{Context, Result};
 use coitrees::IntervalTree;
 use noodles::sam::alignment::RecordBuf;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -71,89 +72,173 @@ struct MateAcc {
     ub: String,
 }
 
-pub fn count(cfg: &Config, ann: &Annotation) -> Result<ReadTable> {
+// Cheap per-record data extracted serially in BAM order (survives the primary/multimapper filters),
+// then handed to the parallel annotator. `blocks` are covered reference intervals for THIS mate.
+struct RawRec {
+    name: Vec<u8>,
+    is_r1: bool,
+    rev: bool,
+    bc: String,
+    ub: String,
+    rid: usize,
+    blocks: Vec<(i64, i64)>,
+    mapped_len: i64,
+}
+
+// Result of the pure, parallel interval-tree annotation of one `RawRec`.
+struct Annotated {
+    name: Vec<u8>,
+    is_r1: bool,
+    rev: bool,
+    bc: String,
+    ub: String,
+    exon_ov: Vec<(u32, i64)>,
+    intron_ov: Vec<(u32, i64)>,
+    frag_blocks: Vec<(usize, i64, i64)>,
+    mapped_len: i64,
+}
+
+const BATCH: usize = 32_768;
+
+pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Result<ReadTable> {
+    use std::time::Duration;
     let out = Path::new(&cfg.out_dir);
     let merged = out.join("star").join(format!("{}.merged.bam", cfg.project));
 
     let mut state = CountState::new();
 
     // ---- pass 1: pair mates, assign genes ----
+    // The interval-tree annotation (covered_blocks feeding two immutable-tree queries) is the heavy
+    // per-record cost and is embarrassingly parallel. We read a batch serially in BAM order, run the
+    // pure annotation in parallel (into_par_iter preserves batch order), then drain the ordered batch
+    // serially so the mate-join, interning and rt.rows push order are byte-identical to single-thread.
+    stage.step("pass 1: annotate + pair mates");
     let mut reader = BamReader::open(&merged)?;
     let ref_names: Vec<String> = reader.ref_names.clone();
     state.ref_names = ref_names.clone();
     state.additional_chroms = ann.genes.iter().filter(|g| g.additional).map(|g| g.chrom.clone()).collect();
     let mut pending: HashMap<Vec<u8>, MateAcc> = HashMap::new();
     let mut rec = RecordBuf::default();
-    while reader.next(&mut rec)? {
-        let fl = bam::flags(&rec);
-        if fl & 0x100 != 0 || fl & 0x800 != 0 {
-            continue; // primary alignments only for assignment
-        }
-        // primary_hit=false == zUMIs countMultiMappingReads=FALSE: drop multimappers entirely
-        if !cfg.counting_opts.primary_hit && bam::tag_int(&rec, [b'N', b'H']).unwrap_or(1) > 1 {
-            continue;
-        }
-        let rid = match bam::ref_id(&rec) {
-            Some(r) => r,
-            None => continue,
-        };
-        let pos = match bam::start(&rec) {
-            Some(p) => p,
-            None => continue,
-        };
-        let blocks = bam::covered_blocks(&rec, pos);
-        let mapped_len: i64 = blocks.iter().map(|&(s, e)| e - s + 1).sum();
-        let chrom = &ref_names[rid];
-        let mut exon_ov = Vec::new();
-        let mut intron_ov = Vec::new();
-        accumulate(&ann.exon_tree, chrom, &blocks, &mut exon_ov);
-        accumulate(&ann.intron_tree, chrom, &blocks, &mut intron_ov);
-        let frag_blocks: Vec<(usize, i64, i64)> = blocks.iter().map(|&(s, e)| (rid, s, e)).collect();
-
-        let is_r1 = fl & 0x40 != 0;
-        let rev = fl & 0x10 != 0;
-        let name = bam::name(&rec).to_vec();
-
-        match pending.remove(&name) {
-            None => {
-                // BC/UB were passed through the mapping by STAR (empty UB => internal read)
-                let bc = bam::tag_string(&rec, [b'B', b'C']).unwrap_or_default();
-                let ub = bam::tag_string(&rec, [b'U', b'B']).unwrap_or_default();
-                pending.insert(
-                    name.clone(),
-                    MateAcc {
-                        name,
-                        bc,
-                        ub,
-                        exon_ov,
-                        intron_ov,
-                        blocks: frag_blocks,
-                        mapped_len,
-                        r1_rev: if is_r1 { Some(rev) } else { None },
-                        r2_rev: if is_r1 { None } else { Some(rev) },
-                    },
-                );
+    let mut n_rec = 0u64;
+    let mut raws: Vec<RawRec> = Vec::with_capacity(BATCH);
+    let mut eof = false;
+    loop {
+        while raws.len() < BATCH {
+            if !reader.next(&mut rec)? {
+                eof = true;
+                break;
             }
-            Some(mut acc) => {
-                for (gene, l) in exon_ov {
-                    add(&mut acc.exon_ov, gene, l);
-                }
-                for (gene, l) in intron_ov {
-                    add(&mut acc.intron_ov, gene, l);
-                }
-                acc.blocks.extend(frag_blocks);
-                acc.mapped_len += mapped_len;
-                if is_r1 {
-                    acc.r1_rev = Some(rev);
-                } else {
-                    acc.r2_rev = Some(rev);
-                }
-                state.finalize(&acc, cfg, ann);
+            n_rec += 1;
+            if n_rec % 1_000_000 == 0 {
+                stage.beat(Duration::from_secs(5), || format!("{:.1}M records annotated", n_rec as f64 / 1e6));
             }
+            let fl = bam::flags(&rec);
+            if fl & 0x100 != 0 || fl & 0x800 != 0 {
+                continue; // primary alignments only for assignment
+            }
+            // primary_hit=false == zUMIs countMultiMappingReads=FALSE: drop multimappers entirely
+            if !cfg.counting_opts.primary_hit && bam::tag_int(&rec, [b'N', b'H']).unwrap_or(1) > 1 {
+                continue;
+            }
+            let rid = match bam::ref_id(&rec) {
+                Some(r) => r,
+                None => continue,
+            };
+            let pos = match bam::start(&rec) {
+                Some(p) => p,
+                None => continue,
+            };
+            let blocks = bam::covered_blocks(&rec, pos);
+            let mapped_len: i64 = blocks.iter().map(|&(s, e)| e - s + 1).sum();
+            // BC/UB were passed through the mapping by STAR (empty UB => internal read); only the
+            // first-seen mate's copy is used at insert time, exactly as before.
+            let bc = bam::tag_string(&rec, [b'B', b'C']).unwrap_or_default();
+            let ub = bam::tag_string(&rec, [b'U', b'B']).unwrap_or_default();
+            raws.push(RawRec {
+                name: bam::name(&rec).to_vec(),
+                is_r1: fl & 0x40 != 0,
+                rev: fl & 0x10 != 0,
+                bc,
+                ub,
+                rid,
+                blocks,
+                mapped_len,
+            });
+        }
+        if raws.is_empty() {
+            if eof {
+                break;
+            } else {
+                continue;
+            }
+        }
+        let batch = std::mem::replace(&mut raws, Vec::with_capacity(BATCH));
+        let annotated: Vec<Annotated> = batch
+            .into_par_iter()
+            .map(|r| {
+                let chrom = &ref_names[r.rid];
+                let mut exon_ov = Vec::new();
+                let mut intron_ov = Vec::new();
+                accumulate(&ann.exon_tree, chrom, &r.blocks, &mut exon_ov);
+                accumulate(&ann.intron_tree, chrom, &r.blocks, &mut intron_ov);
+                let frag_blocks: Vec<(usize, i64, i64)> = r.blocks.iter().map(|&(s, e)| (r.rid, s, e)).collect();
+                Annotated {
+                    name: r.name,
+                    is_r1: r.is_r1,
+                    rev: r.rev,
+                    bc: r.bc,
+                    ub: r.ub,
+                    exon_ov,
+                    intron_ov,
+                    frag_blocks,
+                    mapped_len: r.mapped_len,
+                }
+            })
+            .collect();
+        for a in annotated {
+            match pending.remove(&a.name) {
+                None => {
+                    pending.insert(
+                        a.name.clone(),
+                        MateAcc {
+                            name: a.name,
+                            bc: a.bc,
+                            ub: a.ub,
+                            exon_ov: a.exon_ov,
+                            intron_ov: a.intron_ov,
+                            blocks: a.frag_blocks,
+                            mapped_len: a.mapped_len,
+                            r1_rev: if a.is_r1 { Some(a.rev) } else { None },
+                            r2_rev: if a.is_r1 { None } else { Some(a.rev) },
+                        },
+                    );
+                }
+                Some(mut acc) => {
+                    for (gene, l) in a.exon_ov {
+                        add(&mut acc.exon_ov, gene, l);
+                    }
+                    for (gene, l) in a.intron_ov {
+                        add(&mut acc.intron_ov, gene, l);
+                    }
+                    acc.blocks.extend(a.frag_blocks);
+                    acc.mapped_len += a.mapped_len;
+                    if a.is_r1 {
+                        acc.r1_rev = Some(a.rev);
+                    } else {
+                        acc.r2_rev = Some(a.rev);
+                    }
+                    state.finalize(&acc, cfg, ann);
+                }
+            }
+        }
+        if eof {
+            break;
         }
     }
-    // leftover singletons (one mate mapped)
-    let leftovers: Vec<MateAcc> = pending.into_values().collect();
+    // leftover singletons (one mate mapped) — drained in a deterministic (read-name) order so that
+    // rt.rows push order (and hence downsampling) is reproducible regardless of HashMap seed.
+    let mut leftovers: Vec<MateAcc> = pending.into_values().collect();
+    leftovers.sort_by(|a, b| a.name.cmp(&b.name));
     for acc in &leftovers {
         state.finalize(acc, cfg, ann);
     }
@@ -161,16 +246,41 @@ pub fn count(cfg: &Config, ann: &Annotation) -> Result<ReadTable> {
     state.write_qc(out, ann, &cfg.project)?;
 
     // ---- pass 2: tag every record with GE/GI (BC/UB rode through from the uBAM) ----
+    // GE/GI string building is parallel per batch; records are written serially in BAM order so the
+    // final BAM byte layout is identical to single-thread.
+    stage.step("pass 2: writing tagged BAM");
     let mut reader = BamReader::open(&merged)?;
     let final_bam = out.join(format!("{}.bam", cfg.project));
     let mut writer = TaggedWriter::create(&final_bam, &reader.header)?;
-    let mut rec = RecordBuf::default();
-    while reader.next(&mut rec)? {
-        let name = bam::name(&rec).to_vec();
-        let (ge, gi) = state.assign.get(&name).copied().unwrap_or((NONE, NONE));
-        let ge_str = set_to_str(ge, &state.rt, ann);
-        let gi_str = set_to_str(gi, &state.rt, ann);
-        writer.write(&mut rec, &ge_str, &gi_str)?;
+    let mut batch: Vec<RecordBuf> = Vec::with_capacity(BATCH);
+    loop {
+        batch.clear();
+        let mut eof = false;
+        while batch.len() < BATCH {
+            let mut r = RecordBuf::default();
+            if !reader.next(&mut r)? {
+                eof = true;
+                break;
+            }
+            batch.push(r);
+        }
+        if batch.is_empty() {
+            break;
+        }
+        let tags: Vec<(String, String)> = batch
+            .par_iter()
+            .map(|rec| {
+                let name = bam::name(rec).to_vec();
+                let (ge, gi) = state.assign.get(&name).copied().unwrap_or((NONE, NONE));
+                (set_to_str(ge, &state.rt, ann), set_to_str(gi, &state.rt, ann))
+            })
+            .collect();
+        for (rec, (ge_str, gi_str)) in batch.iter_mut().zip(tags) {
+            writer.write(rec, &ge_str, &gi_str)?;
+        }
+        if eof {
+            break;
+        }
     }
     writer.finish()?;
 
@@ -313,10 +423,11 @@ fn add_coverage(prof: &mut [f64; NBINS], gene: &Gene, blocks: &[(usize, i64, i64
 fn aggregate(map: &HashMap<u32, [f64; NBINS]>, ann: &Annotation, additional: bool) -> Option<[f64; NBINS]> {
     let mut agg = [0.0f64; NBINS];
     let mut n = 0u32;
-    for (&g, prof) in map {
-        if ann.genes[g as usize].additional != additional {
-            continue;
-        }
+    // Sort gene ids so the per-gene FP reduction runs in a fixed order (HashMap order is unstable).
+    let mut genes: Vec<u32> = map.keys().copied().filter(|&g| ann.genes[g as usize].additional == additional).collect();
+    genes.sort_unstable();
+    for g in genes {
+        let prof = &map[&g];
         let max = prof.iter().copied().fold(0.0f64, f64::max);
         if max <= 0.0 {
             continue;

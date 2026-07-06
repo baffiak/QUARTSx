@@ -148,16 +148,13 @@ dump).
 A small self-contained dataset ships in `testdata/`: a mini reference (6 multi-exon genes on both
 strands, with a prebuilt STAR index) and synthetic R1/R2/I1/I2 FASTQs covering exact/substitution/
 indel barcodes, tagged and internal reads, and dedup groups. `test_config.yaml` in the repo root
-points at it with **repo-relative paths**, so run it from the repo root (the directory that holds
-`quartsx.sh`):
+points at it with repo-relative paths, so run it from the repo root:
 
 ```bash
-cd QUARTSx            # the folder you downloaded/cloned
 ./quartsx.sh -y test_config.yaml
 ```
 
-Outputs land in `testdata/run/`. If you invoke it from elsewhere the relative paths won't resolve —
-either `cd` in first, or edit `test_config.yaml` to use absolute paths.
+Outputs land in `testdata/run/`.
 
 ## Usage
 

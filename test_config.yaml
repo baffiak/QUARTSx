@@ -4,9 +4,6 @@ star_tmp: /tmp/quartsx_star_tmp
 num_threads: 4
 mem_limit: 8
 
-# Paths are relative to the repo root — run this from the directory that
-# contains quartsx.sh (e.g. `cd QUARTSx && ./quartsx.sh -y test_config.yaml`).
-
 sequence_files:
   file1:
     name: testdata/R1.fastq.gz
@@ -31,7 +28,7 @@ reference:
   STAR_index: testdata/STARidx
   GTF_file: testdata/annot.gtf
   additional_files: null
-  additional_STAR_params: "--limitBAMsortRAM 2000000000"   # STAR under-reads RAM on Rosetta; cap the BAM-sort buffer
+  additional_STAR_params: "--limitBAMsortRAM 2000000000"
 
 read_filtering:
   adapter_fasta: SmartSeq3xpressAdapter.fa

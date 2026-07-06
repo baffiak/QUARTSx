@@ -8,8 +8,9 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_distr::{Binomial, Distribution};
+use rayon::prelude::*;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -68,7 +69,8 @@ struct GroupAcc {
     readcount_internal: u64,
 }
 
-pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation) -> Result<()> {
+pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Result<()> {
+    stage.step("dedup: collapsing UMIs + writing counts");
     let out = Path::new(&cfg.out_dir);
     let expr = out.join("expression");
     std::fs::create_dir_all(&expr).context("creating expression/")?;
@@ -116,7 +118,7 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation) -> Result<()> {
     writeln!(w, "quant\tfeature\tlevel\tgene\tcell\tvalue")?;
 
     // ---- "all" level ----
-    let mut exon_internal: Option<HashMap<(u32, u32), f64>> = None;
+    let mut exon_internal: Option<BTreeMap<(u32, u32), f64>> = None;
     for (li, &layer) in layers.iter().enumerate() {
         let groups = collapse_rows(rt, &layer, layer_rows[li].iter().copied());
         emit_level(&mut w, rt, ann, layer, "all", &groups)?;
@@ -132,6 +134,7 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation) -> Result<()> {
     }
 
     // ---- downsampling ----
+    stage.step("dedup: downsampling levels");
     let mut rng = StdRng::seed_from_u64(42);
     let max_n = depth.iter().copied().max().unwrap_or(0);
     for (nmin, nmax, label) in parse_splits(&cfg.counting_opts.downsampling, max_n) {
@@ -198,14 +201,26 @@ enum Quant {
     ReadInternal,
 }
 
-fn value_map(groups: &HashMap<(u32, u32), GroupAcc>, quant: Quant, rt: &ReadTable) -> HashMap<(u32, u32), f64> {
-    let mut vals: HashMap<(u32, u32), f64> = HashMap::new();
-    for (&(bc, set), g) in groups {
-        let v = match quant {
-            Quant::Umi => directional(&g.umis) as f64,
-            Quant::Read => g.readcount as f64,
-            Quant::ReadInternal => g.readcount_internal as f64,
-        };
+fn value_map(groups: &HashMap<(u32, u32), GroupAcc>, quant: Quant, rt: &ReadTable) -> BTreeMap<(u32, u32), f64> {
+    // Deterministic parallel reduction: the expensive per-group value (directional UMI dedup) is
+    // computed in parallel over the groups taken in a FIXED (sorted-key) order, so `computed` is an
+    // ordered Vec regardless of thread count; the share fold then runs serially into a BTreeMap so
+    // the FP accumulation order is pinned (matters only under multi_overlap; exact for singletons).
+    let mut items: Vec<(&(u32, u32), &GroupAcc)> = groups.iter().collect();
+    items.sort_unstable_by_key(|(k, _)| **k);
+    let computed: Vec<((u32, u32), f64)> = items
+        .par_iter()
+        .map(|&(k, g)| {
+            let v = match quant {
+                Quant::Umi => directional(&g.umis) as f64,
+                Quant::Read => g.readcount as f64,
+                Quant::ReadInternal => g.readcount_internal as f64,
+            };
+            (*k, v)
+        })
+        .collect();
+    let mut vals: BTreeMap<(u32, u32), f64> = BTreeMap::new();
+    for ((bc, set), v) in computed {
         if v == 0.0 {
             continue;
         }
@@ -234,7 +249,9 @@ fn emit_level<W: Write>(
     Ok(())
 }
 
-// One long-format block: (quant, feature, level, gene_id, cell, value) per non-zero entry.
+// One long-format block: (quant, feature, level, gene_id, cell, value) per non-zero entry. Lines are
+// emitted in canonical (gene_id string, cell string) order so counts.tsv.gz is byte-identical run to
+// run and thread-count-independent (Rust HashMap iteration order is otherwise nondeterministic).
 fn emit<W: Write>(
     w: &mut W,
     rt: &ReadTable,
@@ -242,20 +259,29 @@ fn emit<W: Write>(
     quant: &str,
     feature: &str,
     level: &str,
-    vals: &HashMap<(u32, u32), f64>,
+    vals: &BTreeMap<(u32, u32), f64>,
 ) -> Result<()> {
-    for (&(gene, bc), &v) in vals {
-        writeln!(w, "{quant}\t{feature}\t{level}\t{}\t{}\t{v}", ann.genes[gene as usize].id, rt.barcodes[bc as usize])?;
+    let mut keys: Vec<&(u32, u32)> = vals.keys().collect();
+    keys.sort_unstable_by(|a, b| {
+        ann.genes[a.0 as usize]
+            .id
+            .cmp(&ann.genes[b.0 as usize].id)
+            .then_with(|| rt.barcodes[a.1 as usize].cmp(&rt.barcodes[b.1 as usize]))
+    });
+    for k in keys {
+        let v = vals[k];
+        writeln!(w, "{quant}\t{feature}\t{level}\t{}\t{}\t{v}", ann.genes[k.0 as usize].id, rt.barcodes[k.1 as usize])?;
     }
     Ok(())
 }
 
-fn fpkm_from_internal(internal: &HashMap<(u32, u32), f64>, ann: &Annotation) -> HashMap<(u32, u32), f64> {
-    let mut libsize: HashMap<u32, f64> = HashMap::new();
+fn fpkm_from_internal(internal: &BTreeMap<(u32, u32), f64>, ann: &Annotation) -> BTreeMap<(u32, u32), f64> {
+    // BTreeMap iteration is sorted, so the libsize FP sum is reduced in a fixed order.
+    let mut libsize: BTreeMap<u32, f64> = BTreeMap::new();
     for (&(_, bc), &v) in internal {
         *libsize.entry(bc).or_default() += v;
     }
-    let mut fpkm: HashMap<(u32, u32), f64> = HashMap::new();
+    let mut fpkm: BTreeMap<(u32, u32), f64> = BTreeMap::new();
     for (&(gene, bc), &v) in internal {
         let ls = 1e-6 * libsize[&bc];
         let kb = ann.genes[gene as usize].length as f64 / 1000.0;
