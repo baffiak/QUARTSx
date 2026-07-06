@@ -1,6 +1,6 @@
-project: TestSS3
+project: Test
 out_dir: testdata/run
-star_tmp: /tmp/quartsx_star_tmp
+star_tmp: ./tmp/
 num_threads: 4
 mem_limit: 8
 
@@ -10,7 +10,7 @@ sequence_files:
     base_definition:
       - cDNA(25-150)
       - UMI(12-19)
-    find_pattern: "ATTGCGCAATG;1"
+    find_pattern: "ATTGCGCAATG;2"
   file2:
     name: testdata/R2.fastq.gz
     base_definition:
@@ -37,10 +37,10 @@ read_filtering:
 
 filter_cutoffs:
   BC_filter:
-    num_bases: 1
+    num_bases: 3
     phred: 20
   UMI_filter:
-    num_bases: 1
+    num_bases: 3
     phred: 20
 
 barcodes:
