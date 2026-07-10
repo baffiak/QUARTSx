@@ -12,6 +12,13 @@ pub struct Config {
     pub star_tmp: String,
     pub num_threads: usize,
     pub mem_limit: usize,
+    // §1 thread knobs. T = num_threads; the FILTERING pipeline overlaps N filter/encode workers with
+    // P BGZF deflaters, so the two concurrent pools must satisfy N + P <= T to avoid oversubscription.
+    // Both default (None) => P = T/2, N = T - P. See resolved_threads().
+    #[serde(default)]
+    pub compress_threads: Option<usize>, // P: BGZF deflate workers (default T/2)
+    #[serde(default)]
+    pub filter_threads: Option<usize>, // N: filter/encode workers (default T - P)
     pub read_filtering: ReadFiltering,
     pub filter_cutoffs: FilterCutoffs,
     pub barcodes: Barcodes,
@@ -87,10 +94,37 @@ pub struct CountingOpts {
     pub strand: u8,
     #[serde(deserialize_with = "de_downsampling")]
     pub downsampling: String,
-    #[serde(rename = "primaryHit")]
-    pub primary_hit: bool,
     pub multi_overlap: bool,
     pub fraction_overlap: f64,
+    // §4 multimapper handling. Mode selects the STARsolo --soloMultiMappers resolution strategy.
+    #[serde(default)]
+    pub multi_mappers: MultiMapperMode,
+    // Multimapper cap for the resolver modes (Uniform/Rescue/PropUnique/EM). Ignored when
+    // multi_mappers is Unique (which hardcodes 1/1). Defaults to 20.
+    #[serde(default = "default_multimap_nmax")]
+    pub multimapper_cap: u32,
+}
+
+fn default_multimap_nmax() -> u32 {
+    20
+}
+
+/// STARsolo `--soloMultiMappers` multi-gene resolution mode (§4). Serde parses the bare mode name
+/// straight from YAML (e.g. `multi_mappers: EM`). The five modes are Unique, Uniform, Rescue,
+/// PropUnique, EM; distribution formulas live in count.rs (§4).
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MultiMapperMode {
+    Unique,
+    Uniform,
+    Rescue,
+    PropUnique,
+    EM,
+}
+
+impl Default for MultiMapperMode {
+    fn default() -> Self {
+        MultiMapperMode::Unique
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -220,14 +254,89 @@ impl Config {
             tag_mismatch,
         })
     }
+
+    /// Resolve the FILTERING thread split into `(P, N)` = (BGZF deflaters, filter/encode workers).
+    /// Defaults per §1: `P = compress_threads.unwrap_or(T/2)`, `N = filter_threads.unwrap_or(T-P)`.
+    /// Both pools run CONCURRENTLY, so the invariant `N + P <= T` is enforced here (never oversubscribe
+    /// the allocated cores); each pool is kept >= 1. If an explicit split would exceed T, P is trimmed
+    /// first (BGZF deflate overlaps its ordered write thread and tolerates fewer cores better than the
+    /// CPU-bound filter workers).
+    ///
+    /// T == 1 has NO valid concurrent split (any two positive pools already exceed the one core), so it
+    /// is the SINGLE-THREADED case: `(1, 1)` is returned only as the degenerate budget, and callers MUST
+    /// take their single-threaded path (gated on `num_threads <= 1`) — running inline with no separate
+    /// rayon pool and a single BGZF codec worker — instead of overlapping two CPU-bound pools on the
+    /// lone core.
+    pub fn resolved_threads(&self) -> (usize, usize) {
+        let t = self.num_threads.max(1);
+        if t == 1 {
+            return (1, 1);
+        }
+        let mut p = self.compress_threads.unwrap_or(t / 2).max(1);
+        let mut n = self.filter_threads.unwrap_or(t.saturating_sub(p)).max(1);
+        if p + n > t {
+            // Keep at least one core for the filter workers, then give N the remainder.
+            p = p.min(t.saturating_sub(1)).max(1);
+            n = t.saturating_sub(p).max(1);
+        }
+        (p, n)
+    }
 }
 
 pub fn load(path: &str) -> Result<Config> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     let mut cfg: Config = serde_yaml::from_str(&text).context("parsing config yaml")?;
     cfg.config_path = path.to_string();
+    // §6 Config UX: expand `~` / `$HOME` in ALL path fields BEFORE validate() so existence checks,
+    // FIFO probing and every downstream consumer (orchestrator, filter, count) see absolute paths.
+    expand_paths(&mut cfg);
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Expand a leading `~` / `~/` and `$HOME` / `${HOME}` in a single path string (§6). Non-path YAML
+/// (e.g. STAR params) is not passed through here. Empty strings and paths with no marker pass through
+/// unchanged. Shell-only forms (`~user`, arbitrary `$VARS`) are intentionally NOT expanded — only the
+/// two documented markers, so behavior is identical across macOS / WSL2 / Linux.
+fn expand_path(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => return s.to_string(), // no HOME => leave path untouched rather than corrupt it
+    };
+    let home_trimmed = home.trim_end_matches('/');
+    let mut out = if s == "~" {
+        home.clone()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        format!("{home_trimmed}/{rest}")
+    } else {
+        s.to_string()
+    };
+    // Expand $HOME / ${HOME} anywhere (braced form first — "$HOME" is not a substring of "${HOME}").
+    out = out.replace("${HOME}", &home).replace("$HOME", &home);
+    out
+}
+
+// Apply expand_path to every path-valued field (§6). Kept in one place so the set of expanded fields
+// is auditable; orchestrator/filter/count consume the already-expanded paths and never re-expand.
+fn expand_paths(cfg: &mut Config) {
+    cfg.out_dir = expand_path(&cfg.out_dir);
+    cfg.star_tmp = expand_path(&cfg.star_tmp);
+    cfg.sequence_files.file1.name = expand_path(&cfg.sequence_files.file1.name);
+    cfg.sequence_files.file2.name = expand_path(&cfg.sequence_files.file2.name);
+    cfg.sequence_files.file3.name = expand_path(&cfg.sequence_files.file3.name);
+    cfg.sequence_files.file4.name = expand_path(&cfg.sequence_files.file4.name);
+    cfg.reference.star_index = expand_path(&cfg.reference.star_index);
+    cfg.reference.gtf_file = expand_path(&cfg.reference.gtf_file);
+    if let Some(af) = cfg.reference.additional_files.take() {
+        cfg.reference.additional_files = Some(expand_path(&af));
+    }
+    cfg.barcodes.index_table = expand_path(&cfg.barcodes.index_table);
+    if let Some(af) = cfg.read_filtering.adapter_fasta.take() {
+        cfg.read_filtering.adapter_fasta = Some(expand_path(&af));
+    }
 }
 
 fn validate(cfg: &Config) -> Result<()> {
@@ -273,6 +382,25 @@ fn validate(cfg: &Config) -> Result<()> {
         bail!("BC slice on I2 is {i5_seg_len} bp but i5_index column is {} bp", dims.i5_len);
     }
 
+    // §1 thread knobs: an EXPLICIT split that oversubscribes the cores is a config error, caught here
+    // (resolved_threads() also clamps defensively, but an explicit N+P>T is worth a clear message).
+    if cfg.num_threads == 0 {
+        bail!("num_threads must be >= 1");
+    }
+    if let (Some(p), Some(n)) = (cfg.compress_threads, cfg.filter_threads) {
+        if p == 0 || n == 0 {
+            bail!("compress_threads and filter_threads must each be >= 1 (got P={p}, N={n})");
+        }
+        if p + n > cfg.num_threads {
+            bail!(
+                "compress_threads (P={p}) + filter_threads (N={n}) = {} exceeds num_threads (T={}); \
+                 the filter/encode and BGZF-deflate pools run concurrently and must satisfy N+P<=T",
+                p + n,
+                cfg.num_threads
+            );
+        }
+    }
+
     let out = Path::new(cfg.out_dir.trim_end_matches('/'));
     if Path::new(&cfg.star_tmp).starts_with(out) {
         bail!(
@@ -298,9 +426,14 @@ fn probe_fifo(star_tmp: &str) -> Result<()> {
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EPERM) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => bail!(
-                "star_tmp ({star_tmp}) is on a filesystem without FIFO support; point it at a native ext4/apfs path"
+                "star_tmp ({star_tmp}) is on a filesystem that does not support FIFOs (mkfifo failed: {err}).\n\
+                 QUARTSx streams the decompressed shard into STAR through a named pipe here, so star_tmp \
+                 MUST be on a native POSIX filesystem (ext4 on Linux/WSL2, apfs on macOS).\n\
+                 Common cause: under WSL2 a Windows drive mounted via drvfs/9p (e.g. /mnt/c, /mnt/e) \
+                 cannot host FIFOs. Move star_tmp onto the Linux filesystem, e.g. /home/<user>/quartsx_tmp \
+                 or /tmp, and keep it OFF /mnt/*."
             ),
-            _ => bail!("probing star_tmp ({star_tmp}) for FIFO support: {err}"),
+            _ => bail!("probing star_tmp ({star_tmp}) for FIFO support failed (mkfifo: {err})"),
         }
     }
     let _ = std::fs::remove_file(&probe);

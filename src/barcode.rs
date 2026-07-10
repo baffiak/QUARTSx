@@ -46,22 +46,37 @@ fn pack(seq: &[u8]) -> Option<u64> {
     Some(k)
 }
 
-/// Reverse complement over ACGT; any non-ACGT base becomes 'N'.
+#[inline]
+fn comp(b: u8) -> u8 {
+    match b {
+        b'A' => b'T',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'T' => b'A',
+        _ => b'N',
+    }
+}
+
+/// Reverse-complement `seq` into `dst` (cleared first); any non-ACGT base becomes 'N'.
+/// Allocation-free when `dst` already has capacity — the hot path hands in per-worker scratch so
+/// the orientation flip costs no per-read heap traffic (§1 alloc-churn fix).
+#[inline]
+pub fn revcomp_into(seq: &[u8], dst: &mut Vec<u8>) {
+    dst.clear();
+    dst.reserve(seq.len());
+    dst.extend(seq.iter().rev().map(|&b| comp(b)));
+}
+
+/// Reverse complement over ACGT; any non-ACGT base becomes 'N'. Convenience allocator over
+/// `revcomp_into` (kept for tests and the cold orientation-vote path).
 pub fn revcomp(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|&b| match b {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            _ => b'N',
-        })
-        .collect()
+    let mut v = Vec::with_capacity(seq.len());
+    revcomp_into(seq, &mut v);
+    v
 }
 
 // ----------------------------------------------------------------------------
-// Sequence-Levenshtein distance (Buschmann & Bystrykh 2013)
+// Sequence-Levenshtein distance
 // ----------------------------------------------------------------------------
 
 /// Levenshtein DP with a FREE (unpenalized) 3' / right end on BOTH sequences: the returned
@@ -101,8 +116,6 @@ pub fn seqlev(a: &[u8], b: &[u8]) -> u32 {
 pub struct IndexList {
     /// Table-orientation index strings; id = position in this vec.
     pub codes: Vec<String>,
-    /// Uniform length L of this column (8/10/12 — from the table).
-    pub len: usize,
     /// Packed exact L-mer -> id. Authoritative fast path, never holds REJECT.
     exact: HashMap<u64, u32>,
     /// Packed L-window -> id OR REJECT. Indel/substitution recovery.
@@ -120,6 +133,8 @@ impl IndexList {
         if codes.is_empty() {
             bail!("empty index list");
         }
+        // Uniform-length guard (local only; the length is not stored — decode() packs windows of
+        // any L<=32 and never validates against a stored column length, so the field was dead).
         let len = codes[0].len();
         for c in &codes {
             if c.len() != len {
@@ -174,23 +189,49 @@ impl IndexList {
             });
         }
 
-        Ok(IndexList { codes, len, exact, sphere, min_dist, safe_radius, collisions })
+        Ok(IndexList { codes, exact, sphere, min_dist, safe_radius, collisions })
     }
 
-    /// Hot path: exact map first (O(1), authoritative), then sphere. `obs` must already be in
-    /// table orientation. Returns `None` on a non-ACGT read or a reject/miss.
+    /// Thin wrapper over `decode_full` collapsing reject and miss to `None`; used by the sphere
+    /// unit tests. `obs` must already be in table orientation.
+    #[cfg(test)]
     #[inline]
     pub fn decode(&self, obs: &[u8]) -> Option<u32> {
-        let k = pack(obs)?;
-        if let Some(&id) = self.exact.get(&k) {
-            return Some(id);
-        }
-        match self.sphere.get(&k) {
-            Some(&REJECT) => None,
-            Some(&id) => Some(id),
-            None => None,
+        match self.decode_full(obs) {
+            Decode::Hit { id, .. } => Some(id),
+            Decode::Reject | Decode::Miss => None,
         }
     }
+
+    /// Full decode outcome — distinguishes an exact hit, a sphere-corrected hit, an ambiguous
+    /// REJECT-sentinel window, and a plain miss, and reports the exact-vs-corrected flag inline so
+    /// `assign_into` needs no separate `exact_hit` re-pack (§1) and can split drop reasons (§6).
+    #[inline]
+    fn decode_full(&self, obs: &[u8]) -> Decode {
+        let k = match pack(obs) {
+            Some(k) => k,
+            None => return Decode::Miss, // non-ACGT window
+        };
+        if let Some(&id) = self.exact.get(&k) {
+            return Decode::Hit { id, exact: true };
+        }
+        match self.sphere.get(&k) {
+            Some(&REJECT) => Decode::Reject,
+            Some(&id) => Decode::Hit { id, exact: false },
+            None => Decode::Miss,
+        }
+    }
+}
+
+/// Internal decode outcome for a single index column (see `IndexList::decode_full`).
+#[derive(Clone, Copy)]
+enum Decode {
+    /// Resolved to index `id`; `exact` = matched the authoritative exact map (no correction).
+    Hit { id: u32, exact: bool },
+    /// Window sits on a REJECT sentinel — reachable from >=2 indexes; refuse to guess.
+    Reject,
+    /// Non-ACGT, or outside the edit budget of every index.
+    Miss,
 }
 
 /// Registration rule for the sphere map — unambiguous by construction:
@@ -299,12 +340,12 @@ struct ParsedTable {
 }
 
 /// Table dimensions for config-time validation (charset/length/columns checked here).
+/// Only the two column lengths are surfaced — config::validate cross-checks them against the BC
+/// slice geometry. The row/index counts (`n_i7`/`n_i5`/`n_pairs`) were never read by any consumer
+/// and were removed (§6 dead-code cleanup); tests that need those counts call `parse_table`.
 pub struct TableDims {
     pub i7_len: usize,
     pub i5_len: usize,
-    pub n_i7: usize,
-    pub n_i5: usize,
-    pub n_pairs: usize,
 }
 
 /// Cheap dims/charset/columns probe (config::validate). Calls the full parser.
@@ -313,9 +354,6 @@ pub fn probe_table(path: &str) -> Result<TableDims> {
     Ok(TableDims {
         i7_len: t.i7.first().map(|s| s.len()).unwrap_or(0),
         i5_len: t.i5.first().map(|s| s.len()).unwrap_or(0),
-        n_i7: t.i7.len(),
-        n_i5: t.i5.len(),
-        n_pairs: t.pairs.len(),
     })
 }
 
@@ -435,12 +473,61 @@ fn parse_table(path: &str) -> Result<ParsedTable> {
 pub struct IndexTable {
     pub i7: IndexList,
     pub i5: IndexList,
-    /// Set of valid (i7_id, i5_id) pairs, packed ((i7_id as u64) << 32) | i5_id.
-    pairs: HashSet<u64>,
+    /// Valid (i7_id, i5_id) pairs → pair ordinal. Key packed ((i7_id as u64) << 32) | i5_id.
+    /// The ordinal indexes `labels`; it is also returned to callers as a compact integer barcode id
+    /// so the hot path can carry a `u32` instead of re-hashing a string (§1 alloc-churn fix).
+    pairs: HashMap<u64, u32>,
+    /// Interned `i7 ++ i5` label per valid pair, built ONCE at load. `assign_into` hands back a
+    /// borrow of the ready string — no per-read `format!` concatenation.
+    labels: Vec<String>,
     pub i7_orient: Orient,
     pub i5_orient: Orient,
     /// Panel-guard messages (bcl2fastq-style "distance too small").
     pub warnings: Vec<String>,
+}
+
+/// Per-worker revcomp scratch: one owned buffer per index column, reused across reads so the
+/// orientation flip in `assign_into` allocates zero heap on the hot path (Forward columns don't
+/// even touch it — they borrow the raw window directly). Each filter/encode worker owns one.
+#[derive(Default)]
+pub struct RevcompScratch {
+    o7: Vec<u8>,
+    o5: Vec<u8>,
+}
+
+impl RevcompScratch {
+    pub fn new() -> RevcompScratch {
+        RevcompScratch::default()
+    }
+}
+
+/// Why a read could not be assigned to a cell — lets `filter.rs` split its `no_barcode` bucket into
+/// absent/uncorrectable vs ambiguous-reject for drop-reason reporting (§6). `AmbiguousReject` is the
+/// distinct, scientifically-meaningful case: the read window is correctable-distance from >=2 listed
+/// indexes, so the sphere holds a REJECT sentinel and we refuse to guess (never mis-assign).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnassignedReason {
+    /// An index window landed on a REJECT sentinel (reachable from >=2 indexes) — ambiguous.
+    AmbiguousReject,
+    /// An index window is non-ACGT, or not within the edit budget of ANY listed index (a plain
+    /// miss: absent / uncorrectable).
+    Absent,
+    /// Both indexes decoded to real ids, but the (i7, i5) COMBINATION is not a listed sample cell.
+    InvalidPair,
+}
+
+/// Result of assigning one read's index pair. `Assigned` borrows the interned label from the table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AssignResult<'a> {
+    Assigned {
+        /// Compact pair id (ordinal into the valid-pair list) — a ready integer barcode key.
+        pair_id: u32,
+        /// Interned `i7 ++ i5` table-orientation label (borrowed; no per-read allocation).
+        label: &'a str,
+        /// True iff either index needed the sphere (i.e. not both an exact hit).
+        corrected: bool,
+    },
+    Unassigned(UnassignedReason),
 }
 
 #[inline]
@@ -451,9 +538,23 @@ fn pair_key(id7: u32, id5: u32) -> u64 {
 impl IndexTable {
     pub fn load(path: &str, budget: EditBudget) -> Result<IndexTable> {
         let parsed = parse_table(path)?;
+        let pair_list = parsed.pairs; // move out before the partial moves of i7/i5 below
         let i7 = IndexList::build(parsed.i7, budget)?;
         let i5 = IndexList::build(parsed.i5, budget)?;
-        let pairs: HashSet<u64> = parsed.pairs.iter().map(|&(a, b)| pair_key(a, b)).collect();
+        // Intern one label per valid pair ONCE (ordinal = insertion order over the parsed rows), and
+        // map its packed key -> ordinal. Kills the per-read `format!` on the assign hot path.
+        let mut pairs: HashMap<u64, u32> = HashMap::with_capacity(pair_list.len());
+        let mut labels: Vec<String> = Vec::with_capacity(pair_list.len());
+        for &(a, b) in &pair_list {
+            let key = pair_key(a, b);
+            if let std::collections::hash_map::Entry::Vacant(e) = pairs.entry(key) {
+                e.insert(labels.len() as u32);
+                let mut label = String::with_capacity(i7.codes[a as usize].len() + i5.codes[b as usize].len());
+                label.push_str(&i7.codes[a as usize]);
+                label.push_str(&i5.codes[b as usize]);
+                labels.push(label);
+            }
+        }
 
         let mut warnings = Vec::new();
         for (name, list) in [("i7", &i7), ("i5", &i5)] {
@@ -475,6 +576,7 @@ impl IndexTable {
             i7,
             i5,
             pairs,
+            labels,
             i7_orient: Orient::Forward,
             i5_orient: Orient::Forward,
             warnings,
@@ -495,22 +597,83 @@ impl IndexTable {
         Ok(())
     }
 
-    /// Correct i7 and i5 separately (applying detected orientation), validate the pair, and emit
-    /// the table-orientation `i7 ++ i5` label. Returns `(label, corrected)` where `corrected` is
-    /// true iff either index needed the sphere (i.e. not both exact). `None` = unassigned.
-    pub fn assign_pair(&self, raw_i7: &[u8], raw_i5: &[u8]) -> Option<(String, bool)> {
-        let o7 = if self.i7_orient == Orient::RevComp { revcomp(raw_i7) } else { raw_i7.to_vec() };
-        let o5 = if self.i5_orient == Orient::RevComp { revcomp(raw_i5) } else { raw_i5.to_vec() };
+    /// Hot-path assign: correct i7 and i5 separately (applying detected orientation via per-worker
+    /// `scratch`, so a Forward column borrows the raw window with ZERO copies and a RevComp column
+    /// reuses the scratch buffer), validate the pair, and hand back the interned label + pair id.
+    ///
+    /// Zero per-read heap allocation on the assign path (§1): no revcomp `Vec` churn, no `format!`.
+    /// The decode reason is preserved so `filter.rs` can split drop reasons (§6):
+    /// a REJECT-sentinel hit (ambiguous, reachable from >=2 indexes in the Sequence-Levenshtein
+    /// sphere) is `AmbiguousReject`; anything else non-assigned is `Absent`
+    /// (plain miss) or `InvalidPair` (both indexes real, combination not a listed cell).
+    #[inline]
+    pub fn assign_into<'a>(
+        &'a self,
+        raw_i7: &[u8],
+        raw_i5: &[u8],
+        scratch: &mut RevcompScratch,
+    ) -> AssignResult<'a> {
+        // Borrow the raw window on Forward; fill (and borrow) reusable scratch on RevComp. The two
+        // scratch fields are disjoint so both borrows coexist.
+        let o7: &[u8] = match self.i7_orient {
+            Orient::Forward => raw_i7,
+            Orient::RevComp => {
+                revcomp_into(raw_i7, &mut scratch.o7);
+                &scratch.o7
+            }
+        };
+        let o5: &[u8] = match self.i5_orient {
+            Orient::Forward => raw_i5,
+            Orient::RevComp => {
+                revcomp_into(raw_i5, &mut scratch.o5);
+                &scratch.o5
+            }
+        };
 
-        let id7 = self.i7.decode(&o7)?;
-        let id5 = self.i5.decode(&o5)?;
-        let key = pair_key(id7, id5);
-        if !self.pairs.contains(&key) {
-            return None; // corrected but not a real cell
+        let d7 = self.i7.decode_full(o7);
+        let d5 = self.i5.decode_full(o5);
+
+        // Ambiguous-reject takes priority over a plain miss on the other column: if EITHER index
+        // hit a REJECT sentinel we refuse to guess, and that is the more informative drop reason.
+        if matches!(d7, Decode::Reject) || matches!(d5, Decode::Reject) {
+            return AssignResult::Unassigned(UnassignedReason::AmbiguousReject);
         }
-        let corrected = !self.i7.exact_hit(&o7) || !self.i5.exact_hit(&o5);
-        let label = format!("{}{}", self.i7.codes[id7 as usize], self.i5.codes[id5 as usize]);
-        Some((label, corrected))
+        let (id7, ex7) = match d7 {
+            Decode::Hit { id, exact } => (id, exact),
+            _ => return AssignResult::Unassigned(UnassignedReason::Absent),
+        };
+        let (id5, ex5) = match d5 {
+            Decode::Hit { id, exact } => (id, exact),
+            _ => return AssignResult::Unassigned(UnassignedReason::Absent),
+        };
+
+        match self.pairs.get(&pair_key(id7, id5)) {
+            Some(&pair_id) => AssignResult::Assigned {
+                pair_id,
+                label: &self.labels[pair_id as usize],
+                corrected: !(ex7 && ex5),
+            },
+            None => AssignResult::Unassigned(UnassignedReason::InvalidPair),
+        }
+    }
+
+    /// Interned label for a pair ordinal returned by `assign_into`; used by the tests.
+    #[cfg(test)]
+    #[inline]
+    pub fn label(&self, pair_id: u32) -> &str {
+        &self.labels[pair_id as usize]
+    }
+
+    /// Convenience allocator over `assign_into` — allocates a throwaway scratch and owns the label.
+    /// Returns `(label, corrected)` or `None` for any unassigned reason; used by the tests (the hot
+    /// filter loop uses `assign_into` with per-worker scratch).
+    #[cfg(test)]
+    pub fn assign_pair(&self, raw_i7: &[u8], raw_i5: &[u8]) -> Option<(String, bool)> {
+        let mut scratch = RevcompScratch::new();
+        match self.assign_into(raw_i7, raw_i5, &mut scratch) {
+            AssignResult::Assigned { label, corrected, .. } => Some((label.to_string(), corrected)),
+            AssignResult::Unassigned(_) => None,
+        }
     }
 }
 
@@ -772,9 +935,11 @@ mod tests {
         let d = probe_table(&path).unwrap();
         assert_eq!(d.i7_len, 10);
         assert_eq!(d.i5_len, 10);
-        assert_eq!(d.n_i7, 2);
-        assert_eq!(d.n_i5, 1);
-        assert_eq!(d.n_pairs, 2);
+        // row/index counts now come from the full parser (TableDims dropped its count fields).
+        let t = parse_table(&path).unwrap();
+        assert_eq!(t.i7.len(), 2);
+        assert_eq!(t.i5.len(), 1);
+        assert_eq!(t.pairs.len(), 2);
         std::fs::remove_file(&path).ok();
     }
 
@@ -786,7 +951,7 @@ mod tests {
         let path = tmp("bom.csv", content);
         let d = probe_table(&path).unwrap();
         assert_eq!(d.i7_len, 10);
-        assert_eq!(d.n_i7, 1);
+        assert_eq!(parse_table(&path).unwrap().i7.len(), 1);
         std::fs::remove_file(&path).ok();
     }
 
@@ -799,7 +964,7 @@ mod tests {
             let p = tmp(name, c);
             let d = probe_table(&p).unwrap();
             assert_eq!(d.i7_len, 10);
-            assert_eq!(d.n_i7, 1);
+            assert_eq!(parse_table(&p).unwrap().i7.len(), 1);
             std::fs::remove_file(&p).ok();
         }
     }
@@ -888,5 +1053,86 @@ mod tests {
     #[test]
     fn duplicate_index_is_hard_error() {
         assert!(IndexList::build(vec!["ACGTACGTAC".into(), "ACGTACGTAC".into()], BUDGET).is_err());
+    }
+
+    // ---- assign_into: low-alloc path + drop-reason split (§1/§6) ----
+    #[test]
+    fn assign_into_reasons_split() {
+        // i7 has two Hamming-distance-2 codes so "AAAAAAAAAC" is a shared 1-sub window -> REJECT.
+        let content = b"i7_index,i5_index\n\
+            AAAAAAAAAA,CCCCCCCCCC\n\
+            AAAAAAAACC,CCCCCCCCCC\n";
+        let p = tmp("reasons.csv", content);
+        let table = IndexTable::load(&p, BUDGET).unwrap();
+        let mut sc = RevcompScratch::new();
+
+        // exact valid pair -> Assigned, not corrected, interned label reachable via label().
+        match table.assign_into(b"AAAAAAAAAA", b"CCCCCCCCCC", &mut sc) {
+            AssignResult::Assigned { pair_id, label, corrected } => {
+                assert_eq!(label, "AAAAAAAAAACCCCCCCCCC");
+                assert_eq!(table.label(pair_id), "AAAAAAAAAACCCCCCCCCC");
+                assert!(!corrected);
+            }
+            other => panic!("expected Assigned, got {other:?}"),
+        }
+        // shared 1-sub i7 window -> ambiguous reject (not a plain miss).
+        assert_eq!(
+            table.assign_into(b"AAAAAAAAAC", b"CCCCCCCCCC", &mut sc),
+            AssignResult::Unassigned(UnassignedReason::AmbiguousReject)
+        );
+        // i7 far from any listed index -> plain miss / absent.
+        assert_eq!(
+            table.assign_into(b"TTTTTTTTTT", b"CCCCCCCCCC", &mut sc),
+            AssignResult::Unassigned(UnassignedReason::Absent)
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn assign_into_invalid_pair_reason() {
+        // both indexes decode, but the (TTTTTTTTTT, GGGGGGGGGG) combination is not a listed row.
+        let content = b"i7_index,i5_index\n\
+            AAAAAAAAAA,CCCCCCCCCC\n\
+            AAAAAAAAAA,GGGGGGGGGG\n\
+            TTTTTTTTTT,CCCCCCCCCC\n";
+        let p = tmp("invalidpair.csv", content);
+        let table = IndexTable::load(&p, BUDGET).unwrap();
+        let mut sc = RevcompScratch::new();
+        assert_eq!(
+            table.assign_into(b"TTTTTTTTTT", b"GGGGGGGGGG", &mut sc),
+            AssignResult::Unassigned(UnassignedReason::InvalidPair)
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn assign_into_revcomp_scratch_path() {
+        // Orientation RevComp: the raw read is the revcomp of the listed code; scratch is reused
+        // across calls (no per-read revcomp Vec). One sub on i7 -> corrected = true.
+        let content = b"i7_index,i5_index\nACGTACGTAC,TGCATGCATG\n";
+        let p = tmp("rc.csv", content);
+        let mut table = IndexTable::load(&p, BUDGET).unwrap();
+        table.i7_orient = Orient::RevComp;
+        table.i5_orient = Orient::RevComp;
+        let raw_i7 = revcomp(b"ACGTACGTAC");
+        let raw_i5 = revcomp(b"TGCATGCATG");
+        let mut sc = RevcompScratch::new();
+        match table.assign_into(&raw_i7, &raw_i5, &mut sc) {
+            AssignResult::Assigned { label, corrected, .. } => {
+                assert_eq!(label, "ACGTACGTACTGCATGCATG");
+                assert!(!corrected);
+            }
+            other => panic!("expected Assigned, got {other:?}"),
+        }
+        // reuse the SAME scratch on a second, sphere-corrected call (one sub on the fwd i7 window).
+        let raw_i7_1sub = revcomp(b"ACGTACGTAA");
+        match table.assign_into(&raw_i7_1sub, &raw_i5, &mut sc) {
+            AssignResult::Assigned { label, corrected, .. } => {
+                assert_eq!(label, "ACGTACGTACTGCATGCATG");
+                assert!(corrected);
+            }
+            other => panic!("expected Assigned, got {other:?}"),
+        }
+        std::fs::remove_file(&p).ok();
     }
 }

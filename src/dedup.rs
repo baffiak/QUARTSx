@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, MultiMapperMode};
 use crate::count::{ReadTable, Row, NONE};
 use crate::gtf::Annotation;
 use anyhow::{Context, Result};
@@ -63,10 +63,24 @@ impl Layer {
     }
 }
 
-struct GroupAcc {
-    umis: HashMap<Vec<u8>, u32>,
-    readcount: u64,
-    readcount_internal: u64,
+// Per-UMI accumulator within one cell: read count plus the running INTERSECTION of the per-fragment
+// gene sets of the reads carrying this UMI, kept SEPARATELY by mapping uniqueness so unique evidence
+// can dominate (§4a). `uniq` = intersection over this UMI's uniquely-mapped (NH==1) reads; `multi` =
+// intersection over its multimapping (NH>1) reads. Each is `None` until the first such read; each list
+// stays sorted ascending. The molecule's gene set is taken from `uniq` when present, else `multi`.
+struct UmiAcc {
+    count: u32,
+    uniq: Option<Vec<u32>>,
+    multi: Option<Vec<u32>>,
+}
+
+// Per-(layer, level) collapsed tallies. `mol` is the TAGGED family keyed by the molecule's INTERSECTED
+// gene set (§4); `read`/`read_internal` are per-fragment-set fragment tallies (union, no collapse).
+#[derive(Default)]
+struct LayerCounts {
+    mol: HashMap<(u32, Vec<u32>), u64>,      // umicount: (bc, intersected gene set) -> molecules
+    read: HashMap<(u32, u32), u64>,          // readcount: (bc, per-fragment set id) -> fragments
+    read_internal: HashMap<(u32, u32), u64>, // readcount_internal: (bc, per-fragment set id) -> internal fragments
 }
 
 pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Result<()> {
@@ -117,13 +131,20 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::l
     let mut w = GzEncoder::new(BufWriter::new(f), Compression::default());
     writeln!(w, "quant\tfeature\tlevel\tgene\tcell\tvalue")?;
 
+    let mode = cfg.counting_opts.multi_mappers;
+
     // ---- "all" level ----
+    // Each layer emits its integer blocks (umicount/readcount/readcount_internal) AND the STARsolo-mode
+    // resolver matrices for BOTH families (umicount=tagged, readcount_internal=internal), mirroring the
+    // integer matrix on every axis (§4). The resolver redistributes multi-gene sets by the mode formula;
+    // formulas live in count::write_multimapper_matrices.
     let mut exon_internal: Option<BTreeMap<(u32, u32), f64>> = None;
     for (li, &layer) in layers.iter().enumerate() {
-        let groups = collapse_rows(rt, &layer, layer_rows[li].iter().copied());
-        emit_level(&mut w, rt, ann, layer, "all", &groups)?;
+        let lc = collapse_rows(rt, &layer, layer_rows[li].iter().copied());
+        emit_level(&mut w, rt, ann, layer, "all", &lc)?;
+        emit_resolver(&mut w, rt, ann, mode, layer, "all", &lc)?;
         if layer == Layer::Exon {
-            exon_internal = Some(value_map(&groups, Quant::ReadInternal, rt));
+            exon_internal = Some(set_value_map(&lc.read_internal, rt));
         }
     }
 
@@ -164,8 +185,9 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::l
                 entries.shuffle(&mut rng);
                 sampled.extend(entries.into_iter().take(target as usize));
             }
-            let groups = collapse_rows(rt, &layer, sampled.into_iter());
-            emit_level(&mut w, rt, ann, layer, &level, &groups)?;
+            let lc = collapse_rows(rt, &layer, sampled.into_iter());
+            emit_level(&mut w, rt, ann, layer, &level, &lc)?;
+            emit_resolver(&mut w, rt, ann, mode, layer, &level, &lc)?;
         }
     }
 
@@ -173,62 +195,146 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::l
     Ok(())
 }
 
-fn collapse_rows<I: Iterator<Item = usize>>(rt: &ReadTable, layer: &Layer, rows: I) -> HashMap<(u32, u32), GroupAcc> {
-    let mut groups: HashMap<(u32, u32), GroupAcc> = HashMap::new();
+/// Collapse the rows of one layer into per-(cell, gene-set) tallies (§4).
+///  - `read`/`read_internal`: every fragment contributes ONE unit to its per-fragment (UNION) set,
+///    grouped (bc, set); internal fragments (no UMI) additionally feed `read_internal`. No collapse.
+///  - `mol` (TAGGED family): each cell's UMI-carrying reads are directional-collapsed into molecules.
+///    A molecule's gene set is the INTERSECTION of its member reads' per-fragment sets, but UNIQUE
+///    (NH==1) reads dominate (§4a): if a molecule has any uniquely-mapped read its set is the
+///    intersection of its unique reads only (multimapper reads never alter the integer base and never
+///    reintroduce ambiguity); only molecules with NO unique read fall back to their multimapper
+///    intersection. An empty intersection drops the molecule from the layer. Cells are independent, so
+///    molecule resolution runs in parallel; the integer per-set counts are order-independent to merge.
+fn collapse_rows<I: Iterator<Item = usize>>(rt: &ReadTable, layer: &Layer, rows: I) -> LayerCounts {
+    let mut read: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut read_internal: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut tagged: HashMap<u32, HashMap<Vec<u8>, UmiAcc>> = HashMap::new();
     for ri in rows {
         let r = &rt.rows[ri];
         let set = layer.set_of(r);
         if set == NONE {
             continue;
         }
-        let g = groups
-            .entry((r.bc, set))
-            .or_insert_with(|| GroupAcc { umis: HashMap::new(), readcount: 0, readcount_internal: 0 });
-        g.readcount += 1;
+        *read.entry((r.bc, set)).or_default() += 1;
         if r.umi.is_empty() {
-            g.readcount_internal += 1;
+            *read_internal.entry((r.bc, set)).or_default() += 1;
         } else {
-            *g.umis.entry(r.umi.clone()).or_insert(0) += 1;
+            let genes = rt.set_genes(set);
+            let a = tagged
+                .entry(r.bc)
+                .or_default()
+                .entry(r.umi.clone())
+                .or_insert_with(|| UmiAcc { count: 0, uniq: None, multi: None });
+            a.count += 1;
+            // Fold this read into the intersection of its own uniqueness class, keeping unique and
+            // multimapper evidence apart so unique reads can dominate at resolution (§4a).
+            let slot = if r.uniq { &mut a.uniq } else { &mut a.multi };
+            *slot = Some(match slot.take() {
+                None => genes.to_vec(),
+                Some(cur) => intersect_sorted(&cur, genes),
+            });
         }
     }
-    groups
-}
 
-#[derive(Clone, Copy)]
-enum Quant {
-    Umi,
-    Read,
-    ReadInternal,
-}
-
-fn value_map(groups: &HashMap<(u32, u32), GroupAcc>, quant: Quant, rt: &ReadTable) -> BTreeMap<(u32, u32), f64> {
-    // Deterministic parallel reduction: the expensive per-group value (directional UMI dedup) is
-    // computed in parallel over the groups taken in a FIXED (sorted-key) order, so `computed` is an
-    // ordered Vec regardless of thread count; the share fold then runs serially into a BTreeMap so
-    // the FP accumulation order is pinned (matters only under multi_overlap; exact for singletons).
-    let mut items: Vec<(&(u32, u32), &GroupAcc)> = groups.iter().collect();
-    items.sort_unstable_by_key(|(k, _)| **k);
-    let computed: Vec<((u32, u32), f64)> = items
-        .par_iter()
-        .map(|&(k, g)| {
-            let v = match quant {
-                Quant::Umi => directional(&g.umis) as f64,
-                Quant::Read => g.readcount as f64,
-                Quant::ReadInternal => g.readcount_internal as f64,
-            };
-            (*k, v)
-        })
-        .collect();
-    let mut vals: BTreeMap<(u32, u32), f64> = BTreeMap::new();
-    for ((bc, set), v) in computed {
-        if v == 0.0 {
-            continue;
+    let per_cell: Vec<HashMap<(u32, Vec<u32>), u64>> =
+        tagged.par_iter().map(|(&bc, umis)| resolve_molecules(bc, umis)).collect();
+    let mut mol: HashMap<(u32, Vec<u32>), u64> = HashMap::new();
+    for m in per_cell {
+        for (k, v) in m {
+            *mol.entry(k).or_default() += v;
         }
-        // multi-overlap sets share the value equally across their genes
+    }
+
+    LayerCounts { mol, read, read_internal }
+}
+
+/// Directional-collapse one cell's UMIs into molecules. A molecule's gene set is the INTERSECTION of its
+/// member reads' per-fragment sets, with UNIQUE (NH==1) reads dominating (§4a): when the network has any
+/// uniquely-mapped read the set is the intersection of its unique reads ONLY (multimapper reads are
+/// ignored, so a unique read on gene X is never annihilated by a co-UMI multimapper on {Y,Z}); a network
+/// with no unique read falls back to its multimapper intersection. Empty intersections are dropped.
+/// Returns (bc, set) tallies.
+fn resolve_molecules(bc: u32, umis: &HashMap<Vec<u8>, UmiAcc>) -> HashMap<(u32, Vec<u32>), u64> {
+    // Deterministic node order (count desc, UMI asc) pins network formation regardless of HashMap order.
+    let mut items: Vec<(&[u8], &UmiAcc)> = umis.iter().map(|(k, v)| (k.as_slice(), v)).collect();
+    items.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+    let nodes: Vec<(&[u8], u32)> = items.iter().map(|&(u, a)| (u, a.count)).collect();
+
+    let mut out: HashMap<(u32, Vec<u32>), u64> = HashMap::new();
+    for net in directional_networks(&nodes) {
+        // Fold the network's unique and multimapper intersections independently.
+        let mut uniq: Option<Vec<u32>> = None;
+        let mut multi: Option<Vec<u32>> = None;
+        for &i in &net {
+            let a = items[i].1;
+            if let Some(u) = &a.uniq {
+                uniq = Some(match uniq {
+                    None => u.clone(),
+                    Some(cur) => intersect_sorted(&cur, u),
+                });
+            }
+            if let Some(m) = &a.multi {
+                multi = Some(match multi {
+                    None => m.clone(),
+                    Some(cur) => intersect_sorted(&cur, m),
+                });
+            }
+        }
+        // Unique evidence dominates: commit to the unique intersection whenever the network has ANY
+        // uniquely-mapped read (even if it annihilates to empty -> molecule dropped, exactly as Unique
+        // mode would since it never sees the multimapper reads); only a network with no unique read at
+        // all falls back to its multimapper intersection.
+        if let Some(gv) = uniq.or(multi) {
+            if !gv.is_empty() {
+                *out.entry((bc, gv)).or_default() += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Intersection of two ASCENDING-sorted gene-id slices (result stays sorted).
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+fn umi_value_map(mol: &HashMap<(u32, Vec<u32>), u64>) -> BTreeMap<(u32, u32), f64> {
+    // gEu = UNIQUE-ONLY INTEGER base (§4): a molecule contributes ONLY when its intersected gene set
+    // is exactly one gene. Multi-gene molecules go solely to the `umicount_mult_<mode>` resolver, never
+    // here, so `base + umicount_mult_<mode>` reconstructs UniqueAndMult with no double-count. Each
+    // single-gene set {g} is one HashMap key, so each (gene, bc) gets one integer add -> order-safe.
+    let mut vals: BTreeMap<(u32, u32), f64> = BTreeMap::new();
+    for (k, &c) in mol {
+        if k.1.len() == 1 {
+            *vals.entry((k.1[0], k.0)).or_default() += c as f64;
+        }
+    }
+    vals
+}
+
+fn set_value_map(m: &HashMap<(u32, u32), u64>, rt: &ReadTable) -> BTreeMap<(u32, u32), f64> {
+    // gEu = UNIQUE-ONLY INTEGER base (§4): a fragment contributes ONLY when its per-fragment gene set
+    // is exactly one gene. Multi-gene (multi-overlap / multimapper) fragments go solely to the
+    // `<family>_mult_<mode>` resolver, never the base. Each single-gene set interns to one id, so each
+    // (gene, bc) gets one integer add -> order-safe.
+    let mut vals: BTreeMap<(u32, u32), f64> = BTreeMap::new();
+    for (&(bc, set), &c) in m {
         let genes = rt.set_genes(set);
-        let share = v / genes.len() as f64;
-        for &gene in genes {
-            *vals.entry((gene, bc)).or_default() += share;
+        if genes.len() == 1 {
+            *vals.entry((genes[0], bc)).or_default() += c as f64;
         }
     }
     vals
@@ -240,12 +346,38 @@ fn emit_level<W: Write>(
     ann: &Annotation,
     layer: Layer,
     level: &str,
-    groups: &HashMap<(u32, u32), GroupAcc>,
+    lc: &LayerCounts,
 ) -> Result<()> {
-    for (quant, name) in [(Quant::Umi, "umicount"), (Quant::Read, "readcount"), (Quant::ReadInternal, "readcount_internal")] {
-        let vals = value_map(groups, quant, rt);
-        emit(w, rt, ann, name, layer.feature(), level, &vals)?;
+    emit(w, rt, ann, "umicount", layer.feature(), level, &umi_value_map(&lc.mol))?;
+    emit(w, rt, ann, "readcount", layer.feature(), level, &set_value_map(&lc.read, rt))?;
+    emit(w, rt, ann, "readcount_internal", layer.feature(), level, &set_value_map(&lc.read_internal, rt))?;
+    Ok(())
+}
+
+/// Emit the STARsolo-mode resolver matrices for one (layer, level) for BOTH families, mirroring the
+/// integer matrix (§4): `umicount` from tagged molecules (INTERSECTED sets), `readcount_internal` from
+/// internal fragments (per-fragment sets). Unique mode emits nothing (resolver early-returns).
+fn emit_resolver<W: Write>(
+    w: &mut W,
+    rt: &ReadTable,
+    ann: &Annotation,
+    mode: MultiMapperMode,
+    layer: Layer,
+    level: &str,
+    lc: &LayerCounts,
+) -> Result<()> {
+    if mode == MultiMapperMode::Unique {
+        return Ok(());
     }
+    let tagged: HashMap<(u32, Vec<u32>), f64> =
+        lc.mol.iter().map(|(k, &c)| (k.clone(), c as f64)).collect();
+    crate::count::write_multimapper_matrices(w, rt, ann, mode, &tagged, "umicount", layer.feature(), level)?;
+    let internal: HashMap<(u32, Vec<u32>), f64> = lc
+        .read_internal
+        .iter()
+        .map(|(&(bc, set), &c)| ((bc, rt.set_genes(set).to_vec()), c as f64))
+        .collect();
+    crate::count::write_multimapper_matrices(w, rt, ann, mode, &internal, "readcount_internal", layer.feature(), level)?;
     Ok(())
 }
 
@@ -292,16 +424,16 @@ fn fpkm_from_internal(internal: &BTreeMap<(u32, u32), f64>, ann: &Annotation) ->
     fpkm
 }
 
-/// UMI-tools directional (Smith/Heger/Sudbery 2017), edit distance 1. Distinct UMIs are nodes with
+/// UMI-tools directional method, edit distance 1. Distinct UMIs are nodes with
 /// read counts; a directed edge a->b exists when hamming(a,b)==1 and count[a] >= 2*count[b] - 1.
-/// Molecules = number of directed networks: visiting nodes high->low count, each unvisited node seeds
-/// a network that absorbs everything reachable along out-edges.
-fn directional(umis: &HashMap<Vec<u8>, u32>) -> u64 {
-    let n = umis.len();
-    if n <= 1 {
-        return n as u64;
+/// Molecules = directed networks: visiting nodes high->low count, each unvisited node seeds a network
+/// that absorbs everything reachable along out-edges. Returns each network's member node indices
+/// (into `nodes`, which the caller pre-sorts count-desc/UMI-asc for deterministic membership).
+fn directional_networks(nodes: &[(&[u8], u32)]) -> Vec<Vec<usize>> {
+    let n = nodes.len();
+    if n == 0 {
+        return Vec::new();
     }
-    let nodes: Vec<(&[u8], u32)> = umis.iter().map(|(k, &v)| (k.as_slice(), v)).collect();
     let index: HashMap<&[u8], usize> = nodes.iter().enumerate().map(|(i, &(k, _))| (k, i)).collect();
 
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -315,18 +447,17 @@ fn directional(umis: &HashMap<Vec<u8>, u32>) -> u64 {
         }
     }
 
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| nodes[b].1.cmp(&nodes[a].1)); // descending count
     let mut visited = vec![false; n];
-    let mut networks = 0u64;
-    for &start in &order {
+    let mut networks: Vec<Vec<usize>> = Vec::new();
+    for start in 0..n {
         if visited[start] {
             continue;
         }
-        networks += 1;
+        let mut members = Vec::new();
         let mut stack = vec![start];
         visited[start] = true;
         while let Some(u) = stack.pop() {
+            members.push(u);
             for &v in &adj[u] {
                 if !visited[v] {
                     visited[v] = true;
@@ -334,6 +465,7 @@ fn directional(umis: &HashMap<Vec<u8>, u32>) -> u64 {
                 }
             }
         }
+        networks.push(members);
     }
     networks
 }

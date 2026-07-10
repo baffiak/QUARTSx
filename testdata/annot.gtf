@@ -27,3 +27,6 @@ chr2	synth	gene	5601	6850	.	-	.	gene_id "GeneF"; gene_name "GeneF";
 chr2	synth	transcript	5601	6850	.	-	.	gene_id "GeneF"; transcript_id "GeneF.1"; gene_name "GeneF";
 chr2	synth	exon	5601	5950	.	-	.	gene_id "GeneF"; transcript_id "GeneF.1"; exon_number "1"; gene_name "GeneF";
 chr2	synth	exon	6501	6850	.	-	.	gene_id "GeneF"; transcript_id "GeneF.1"; exon_number "2"; gene_name "GeneF";
+chrPar	synth	gene	301	600	.	+	.	gene_id "ParalogG"; gene_name "ParalogG";
+chrPar	synth	transcript	301	600	.	+	.	gene_id "ParalogG"; transcript_id "ParalogG.1"; gene_name "ParalogG";
+chrPar	synth	exon	301	600	.	+	.	gene_id "ParalogG"; transcript_id "ParalogG.1"; exon_number "1"; gene_name "ParalogG";

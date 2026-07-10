@@ -3,6 +3,9 @@ out_dir: testdata/run
 star_tmp: ./tmp/
 num_threads: 4
 mem_limit: 8
+# Optional thread split (auto by default; compress_threads + filter_threads <= num_threads):
+# compress_threads: 2
+# filter_threads: 2
 
 sequence_files:
   file1:
@@ -52,8 +55,11 @@ counting_opts:
   introns: true
   strand: 1
   downsampling: 0
-  primaryHit: true
   multi_overlap: false
   fraction_overlap: 0
+  # Multimapper mode: Unique | Uniform | Rescue | PropUnique | EM
+  multi_mappers: EM
+  # multimapper cap for resolver modes; ignored when multi_mappers is Unique
+  multimapper_cap: 20
 
 start_stage: Filtering

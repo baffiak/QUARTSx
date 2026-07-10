@@ -20,6 +20,62 @@ pub struct Annotation {
     pub intron_tree: HashMap<String, Tree>,
 }
 
+impl Gene {
+    /// Project a fragment's covered reference blocks onto THIS gene's exon-union transcript
+    /// coordinate and return the inclusive transcript-space span `(tmin, tmax)`, or `None`
+    /// if no block overlaps any exon of this gene.
+    ///
+    /// `blocks` are `(ref_id, ref_start, ref_end)` covered reference intervals (1-based
+    /// inclusive) of BOTH mates, exactly as produced by `bam::covered_blocks`. `ref_names`
+    /// maps `ref_id -> contig name` so we can gate on `gene.chrom` (mirrors `count::add_coverage`).
+    ///
+    /// Projection formula: for a reference base `pos` falling in exon `(es, ee)`, its forward
+    /// transcript coordinate is `cum + (pos - es)`, where `cum` is the number of transcript
+    /// bases lying in earlier exons. This is the SAME `cum + (pos - es)` mapping used by
+    /// `count::add_coverage` for the gene-body 5'->3' profile (single authority for
+    /// reference->transcript projection), so insert-size and coverage agree by construction.
+    ///
+    /// The forward transcript coordinate is monotonically increasing along the reference within
+    /// an exon and `cum` is monotonically increasing across exons, so the projected image of a
+    /// [a, b] overlap is exactly [cum + (a - es), cum + (b - es)] — no need to walk every base.
+    /// Strand only applies the order-reversing affine map `off = len - 1 - fwd` (see
+    /// `add_coverage`); that is a reflection, so it leaves the span WIDTH `tmax - tmin + 1`
+    /// invariant. We therefore return forward-strand transcript coordinates and let the caller
+    /// (`count.rs`) take `tmax - tmin + 1` as the transcript-space fragment length (§5). Measuring
+    /// in transcript space collapses introns to zero span; a distant/discordant mate projects onto
+    /// ~no exon of this gene, so it cannot inflate the length.
+    pub fn project_transcript_span(
+        &self,
+        blocks: &[(usize, i64, i64)],
+        ref_names: &[String],
+    ) -> Option<(i64, i64)> {
+        let mut tmin: Option<i64> = None;
+        let mut tmax: Option<i64> = None;
+        for &(rid, bs, be) in blocks {
+            // Only project blocks on this gene's contig (mirror count::add_coverage's chrom gate).
+            if ref_names.get(rid).map(|c| c != &self.chrom).unwrap_or(true) {
+                continue;
+            }
+            let mut cum = 0i64; // transcript bases before the current exon
+            for &(es, ee) in &self.exons {
+                let a = bs.max(es);
+                let b = be.min(ee);
+                if a <= b {
+                    let lo = cum + (a - es);
+                    let hi = cum + (b - es);
+                    tmin = Some(tmin.map_or(lo, |m: i64| m.min(lo)));
+                    tmax = Some(tmax.map_or(hi, |m: i64| m.max(hi)));
+                }
+                cum += ee - es + 1;
+            }
+        }
+        match (tmin, tmax) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        }
+    }
+}
+
 struct GeneBuild {
     id: String,
     chrom: String,
