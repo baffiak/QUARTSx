@@ -6,12 +6,11 @@
 //! Heartbeats are rate-limited so long-running loops can call [`Stage::beat`]
 //! per batch without ever emitting per-read output.
 //!
-//! [`Progress`] is the shared byte-progress-bar primitive that replaces the old
-//! ~5 s `beat` heartbeats inside the long streaming loops (FILTERING §1 over input
-//! bytes; COUNTING §3 over BGZF bytes of checkpoint 2). It is a lock-free counter
-//! with a rate-limited, timestamped in-place redraw: workers call
-//! [`Progress::set`] on the hot path (a relaxed atomic write plus a cheap time
-//! check) and at most one thread ever repaints the line.
+//! [`Progress`] is the shared byte-progress-bar primitive used inside the long
+//! streaming loops. It is a lock-free counter with a rate-limited, timestamped
+//! in-place redraw: workers call [`Progress::set`] on the hot path (a relaxed
+//! atomic write plus a cheap time check) and at most one thread ever repaints
+//! the line.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -92,8 +91,7 @@ impl Stage {
 }
 
 /// Shared byte-progress-bar primitive: a lock-free counter with a rate-limited,
-/// timestamped, in-place redraw to stderr. Replaces the old 5 s `beat`
-/// heartbeats in the FILTERING (§1) and COUNTING (§3) streaming loops.
+/// timestamped, in-place redraw to stderr.
 ///
 /// Concurrency model: [`set`](Progress::set) does one relaxed atomic write plus a
 /// cheap elapsed-time comparison, so any number of rayon workers may report
@@ -117,15 +115,15 @@ pub struct Progress {
     /// Minimum gap between repaints (small on a TTY for smoothness, large when
     /// writing to a log file to avoid thousands of lines).
     interval_ms: u64,
-    /// Width in chars of the previously painted line, used to pad-clear on a TTY.
+    /// Char width used to pad-clear leftover characters when a TTY line is repainted shorter.
     last_len: AtomicUsize,
     tty: bool,
     done: AtomicBool,
 }
 
 impl Progress {
-    /// Create a progress bar. Prefer [`Stage::progress_bytes`] /
-    /// [`Stage::progress_reads`] so the bar inherits the stage name.
+    /// Create a progress bar. Prefer [`Stage::progress_bytes`] so the bar
+    /// inherits the stage name.
     pub fn new(label: &'static str, total: u64) -> Progress {
         let tty = stderr_is_tty();
         Progress {
@@ -134,8 +132,7 @@ impl Progress {
             current: AtomicU64::new(0),
             start: Instant::now(),
             last_draw_ms: AtomicU64::new(0),
-            // 150 ms → smooth on a terminal; 5 s → sparse in a redirected log,
-            // matching the old heartbeat cadence the bar replaces.
+            // 150 ms → smooth on a terminal; 5 s → sparse in a redirected log.
             interval_ms: if tty { 150 } else { 5_000 },
             last_len: AtomicUsize::new(0),
             tty,

@@ -34,7 +34,7 @@ fn dir_size_gb(path: &str) -> Result<f64> {
 // deadlock if a grandchild inherits the write-end and blocks). On non-zero exit, print
 // ONE FAILURE line + the last 15 log lines and bail with a short message; the full child
 // output stays in `log_path` for inspection.
-fn checked(cmd: &mut Command, what: &str, log_path: &Path) -> Result<()> {
+pub(crate) fn checked(cmd: &mut Command, what: &str, log_path: &Path) -> Result<()> {
     let f = File::create(log_path).with_context(|| format!("creating {}", log_path.display()))?;
     let ferr = f.try_clone().with_context(|| format!("cloning {}", log_path.display()))?;
     cmd.stdin(Stdio::null()).stdout(Stdio::from(f)).stderr(Stdio::from(ferr));
@@ -60,7 +60,7 @@ pub fn run(cfg: &Config, start: Instant) -> Result<()> {
     // called once per process; a second call is a harmless no-op for our single-run CLI).
     let _ = rayon::ThreadPoolBuilder::new().num_threads(cfg.num_threads).build_global();
 
-    // §6 lazy folders: create ONLY the out root + logs/ up front (logging is needed immediately).
+    // Create ONLY the out root + logs/ up front (logging is needed immediately).
     // filtered/ star/ qc/ expression/ are each created at their first write per stage (see
     // build_final_annot, the filtering block, run_fastqc, and count/dedup's own expression/ creation)
     // so a resume-from-a-later-stage run never litters unused empty folders.
@@ -79,7 +79,7 @@ pub fn run(cfg: &Config, start: Instant) -> Result<()> {
         if stage <= StartStage::Mapping { Some(preflight_star(cfg)?) } else { None };
 
     // final_annot (GTF + spike-in exon lines) is only needed by MAPPING and COUNTING; skip it (and
-    // the star/ folder + GTF copy it entails) on a Summarising-only resume (§6 lazy work).
+    // the star/ folder + GTF copy it entails) on a Summarising-only resume.
     let final_annot: Option<PathBuf> =
         if stage <= StartStage::Counting { Some(build_final_annot(cfg)?) } else { None };
 
@@ -104,7 +104,7 @@ pub fn run(cfg: &Config, start: Instant) -> Result<()> {
         let annot = final_annot.as_ref().expect("final_annot built for stage <= Mapping");
         let cdna_len = detect_cdna_len(&out.join("filtered"), &cfg.project, n)?;
         run_star(cfg, n, annot, cdna_len, star_params.as_deref().unwrap_or(&[]), &st)?;
-        // §2: single instance writes the coordinate-sorted checkpoint DIRECTLY (no merge/rename).
+        // Single instance writes the coordinate-sorted checkpoint DIRECTLY (no merge/rename).
         // n>1: samtools-merge the per-instance sorted BAMs into the one no-number checkpoint.
         if n > 1 {
             merge_bams(cfg, n, &st)?;
@@ -121,7 +121,7 @@ pub fn run(cfg: &Config, start: Instant) -> Result<()> {
         st.step(format!("annotation loaded ({} genes)", ann.genes.len()));
         let rt = count::count(cfg, &ann, &st)?;
         dedup::collapse(&rt, cfg, &ann, &st)?;
-        // Final indexable checkpoint-3 target is star/{project}.tagged.bam (was {project}.bam).
+        // Final indexable checkpoint-3 target is star/{project}.tagged.bam.
         let final_bam = out.join("star").join(format!("{}.tagged.bam", cfg.project));
         st.step("indexing final BAM");
         checked(
@@ -148,7 +148,7 @@ pub fn run(cfg: &Config, start: Instant) -> Result<()> {
 }
 
 // Count the filtered shard(s) present on disk when resuming past FILTERING, via the single naming
-// authority bam::filtered_shard_path (no shard_{i}.bam literals). The multi-instance scheme is
+// authority bam::filtered_shard_path. The multi-instance scheme is
 // {project}.filtered.{i}.bam (probe with n=2 to select the numbered branch); the common single
 // path is the no-suffix {project}.filtered.bam.
 fn count_shards(dir: &Path, project: &str) -> Result<usize> {
@@ -166,7 +166,7 @@ fn count_shards(dir: &Path, project: &str) -> Result<usize> {
 
 // GTF plus a one-exon "User" gene per additional_files contig (for STAR --genomeFastaFiles spike-ins).
 fn build_final_annot(cfg: &Config) -> Result<PathBuf> {
-    // star/ is created lazily here — the first write into it (§6).
+    // star/ is created lazily here — the first write into it.
     let star_dir = Path::new(&cfg.out_dir).join("star");
     std::fs::create_dir_all(&star_dir).with_context(|| format!("creating {}", star_dir.display()))?;
     let path = star_dir.join(format!("{}.final_annot.gtf", cfg.project));
@@ -208,10 +208,6 @@ fn fasta_lengths(path: &str) -> Result<Vec<(String, usize)>> {
     Ok(out)
 }
 
-// Mode of the first ~1000 shard read1 lengths -> STAR --sjdbOverhang basis. STAR manual (§2.2.3)
-// recommends sjdbOverhang = max(mate length) - 1 for splice-junction database construction; here we
-// derive that max from the actual filtered read1 length distribution (SS3xpress R1 is fixed-length
-// after tag/UMI stripping). The tie-break (below) makes the pick deterministic (§1).
 fn detect_cdna_len(filtered_dir: &Path, project: &str, n: usize) -> Result<usize> {
     let shard0 = crate::bam::filtered_shard_path(filtered_dir, project, 0, n);
     let mut reader = BamReader::open(&shard0, 0)?; // single-threaded: reading only ~1000 records
@@ -224,7 +220,7 @@ fn detect_cdna_len(filtered_dir: &Path, project: &str, n: usize) -> Result<usize
             seen += 1;
         }
     }
-    // §1 determinism fix: HashMap iteration order is nondeterministic, so a plain max_by_key on the
+    // HashMap iteration order is nondeterministic, so a plain max_by_key on the
     // count alone would break ties arbitrarily run-to-run. The key length `l` is unique across map
     // entries, so ordering by (count, Reverse(length)) is a TOTAL order -> the pick is fully
     // deterministic regardless of iteration order (ties broken toward the shorter length).
@@ -255,13 +251,12 @@ const RESERVED_STAR_FLAGS: &[&str] = &[
     "--genomeFastaFiles",
 ];
 
-// §2 preflight: fail in seconds (before filtering) on a broken STAR setup. Validates the STAR index
+// Preflight: fail in seconds (before filtering) on a broken STAR setup. Validates the STAR index
 // integrity, dry-checks additional_STAR_params, and auto-expands the per-mate clip parameters for our
 // 2-mate PE shard. Returns the validated + expanded extra STAR argument tokens.
 fn preflight_star(cfg: &Config) -> Result<Vec<String>> {
-    // 1) STAR index integrity. A STAR genome index (STAR --runMode genomeGenerate) always writes these
-    //    core files (read/mmapped at load). Missing any of them means a truncated/incompatible index
-    //    -> catch it now, not after filtering.
+    // 1) Index integrity: a complete STAR index has these core files; a missing one means a
+    //    truncated/incompatible index -> catch it now, not after filtering.
     let idx = Path::new(&cfg.reference.star_index);
     for f in ["Genome", "SA", "SAindex", "genomeParameters.txt", "chrNameLength.txt"] {
         if !idx.join(f).exists() {
@@ -290,11 +285,8 @@ fn preflight_star(cfg: &Config) -> Result<Vec<String>> {
         }
     }
 
-    // 3) auto-expand per-mate clip params. Our shard is a 2-mate PE SAM (R1 tagged + R2 internal), so
-    //    STAR 2.7.10b requires ONE value per mate for --clip3pAdapterSeq / --clip3pAdapterMMp; a lone
-    //    value aborts with "--clip3pAdapterSeq has to contain 2 values to match the number of mates".
-    //    Duplicate a single adapter sequence to both mates and pair it with the STAR-default mismatch
-    //    prop 0.1/0.1.
+    // 3) auto-expand per-mate clip params for the 2-mate PE shard: duplicate a lone
+    //    --clip3pAdapterSeq value to both mates and give a matching 2-value --clip3pAdapterMMp (0.1/0.1).
     expand_clip_params(&mut toks);
     Ok(toks)
 }
@@ -348,8 +340,8 @@ fn teardown(kids: &mut [(usize, Child, PathBuf, PathBuf)]) {
 
 // Surface STAR's OWN standard progress lines (the "..... started mapping" markers STAR prints to
 // stderr, which we redirect to `logf`) as they are appended — WITHOUT re-reading already-shown bytes.
-// The verbose per-instance STAR Log.out stays file-only; the noisy Log.progress.out is never shown
-// (§2 CLOSED). `offset` advances only over complete (newline-terminated) lines so a line mid-write is
+// The verbose per-instance STAR Log.out stays file-only; the noisy Log.progress.out is never shown.
+// `offset` advances only over complete (newline-terminated) lines so a line mid-write is
 // left for the next poll. Non-UTF8 bytes are lossily decoded (STAR progress is ASCII).
 fn surface_star_progress(logf: &Path, offset: &mut u64, i: usize, n: usize, stage: &Stage) {
     use std::io::{Read, Seek, SeekFrom};
@@ -399,8 +391,8 @@ fn run_star(
     let threads = (cfg.num_threads / n).max(1);
     let overhang = cdna_len.saturating_sub(1).max(1);
 
-    // §2/§4: Unique mode caps multimappers to 1 locus (1/1) so STAR marks them UNMAPPED at MAPPING;
-    // the resolver modes inject no cap flags and use STAR's own defaults.
+    // Unique mode caps multimappers to 1 locus (1/1) so STAR marks them UNMAPPED at MAPPING;
+    // the resolver modes cap at counting_opts.multimapper_cap instead.
     let unique_mode = cfg.counting_opts.multi_mappers == crate::config::MultiMapperMode::Unique;
 
     // Spawn all n STAR instances up front (n is small — bounded by the cpu/mem budget — so
@@ -408,7 +400,7 @@ fn run_star(
     // (process_group(0)) with stdout/stderr redirected to a file (never a pipe → no deadlock).
     let mut kids: Vec<(usize, Child, PathBuf, PathBuf)> = Vec::with_capacity(n);
     for i in 0..n {
-        // §2 naming: single instance writes STAR's own checkpoint name directly (prefix "{project}.",
+        // Single instance writes STAR's own checkpoint name directly (prefix "{project}.",
         // no number, no merge). Multiple instances use "{project}_{i}." and are merged afterwards.
         let prefix = if n == 1 {
             star_dir.join(format!("{}.", cfg.project))
@@ -416,7 +408,7 @@ fn run_star(
             star_dir.join(format!("{}_{i}.", cfg.project))
         };
         let tmp = Path::new(&cfg.star_tmp).join(format!("{}.star.{i}", cfg.project));
-        let _ = std::fs::remove_dir_all(&tmp); // STAR requires outTmpDir to not pre-exist
+        let _ = std::fs::remove_dir_all(&tmp);
         let shard = crate::bam::filtered_shard_path(&out.join("filtered"), &cfg.project, i, n);
         let logf = logs.join(format!("star.{i}.log"));
         // Any failure here (log open, fd clone, fork/exec) must NOT orphan the STAR instances
@@ -467,9 +459,9 @@ fn run_star(
     }
     stage.step(format!("{n} STAR instance(s) launched ({threads} threads each)"));
 
-    // Poll: surface each instance's own STAR progress lines as they appear (no generic
-    // "N/N still running" heartbeat — §2 CLOSED). On the FIRST non-zero exit, tear down every peer
-    // immediately (prompt failure, seconds — no waiting for the slowest survivor) and bail.
+    // Poll: surface each instance's own STAR progress lines as they appear. On the FIRST non-zero
+    // exit, tear down every peer immediately (prompt failure, seconds — no waiting for the slowest
+    // survivor) and bail.
     let mut offsets = vec![0u64; n];
     loop {
         for i in 0..n {
@@ -522,13 +514,12 @@ fn run_star(
     Ok(())
 }
 
-// §2 (n>1 only): samtools-merge the per-instance coordinate-sorted BAMs into the ONE no-number
+// (n>1 only) samtools-merge the per-instance coordinate-sorted BAMs into the ONE no-number
 // checkpoint, then remove the per-instance files (keep exactly one ~90 GB checkpoint).
 fn merge_bams(cfg: &Config, n: usize, stage: &Stage) -> Result<()> {
     let star_dir = Path::new(&cfg.out_dir).join("star");
     let logs = Path::new(&cfg.out_dir).join("logs");
-    // STAR's ACTUAL emitted sorted-BAM name is "<prefix>Aligned.sortedByCoord.out.bam" (lowercase
-    // 'sorted', capital 'Coord'); the merged checkpoint uses the no-number "{project}." prefix.
+    // This name must match STAR's emitted sorted-BAM exactly; the merged checkpoint uses the "{project}." prefix.
     let checkpoint = star_dir.join(format!("{}.Aligned.sortedByCoord.out.bam", cfg.project));
     stage.step(format!("merging {n} coordinate-sorted BAM(s) -> checkpoint"));
     let mut cmd = Command::new("samtools");
@@ -540,10 +531,6 @@ fn merge_bams(cfg: &Config, n: usize, stage: &Stage) -> Result<()> {
         parts.push(p);
     }
     checked(&mut cmd, "samtools merge", &logs.join("samtools_merge.log"))?;
-    // IMPL NOTE (verified): `samtools merge` PRESERVES coordinate sort order from sorted inputs and
-    // re-sort is needed ONLY if the inputs' @SQ header orders conflict (samtools-merge(1) manpage).
-    // All instances map against the SAME STAR index -> identical @SQ order -> the merged output is
-    // already coordinate-sorted; no separate `samtools sort` pass required.
     // Remove the per-instance BAMs now folded into the checkpoint (keep exactly ONE ~90 GB file).
     for p in parts {
         let _ = std::fs::remove_file(&p);
@@ -552,7 +539,7 @@ fn merge_bams(cfg: &Config, n: usize, stage: &Stage) -> Result<()> {
 }
 
 // FastQC (falco engine) on the sampled filtered reads -> flat qc/. QUARTSx's OWN outputs stay neutral
-// (qc/, fastqc.*.log); only the invoked binary and the tool's in-report name are falco's (§6, §0).
+// (qc/, fastqc.*.log); only the invoked binary and the tool's in-report name are falco's.
 fn run_fastqc(cfg: &Config, stage: &Stage) -> Result<()> {
     let qc = Path::new(&cfg.out_dir).join("qc");
     let logs = Path::new(&cfg.out_dir).join("logs");
@@ -561,7 +548,7 @@ fn run_fastqc(cfg: &Config, stage: &Stage) -> Result<()> {
         if !fq.exists() {
             continue;
         }
-        // qc/ is created lazily at the first QC write (§6).
+        // qc/ is created lazily at the first QC write.
         std::fs::create_dir_all(&qc).with_context(|| format!("creating {}", qc.display()))?;
         stage.step(format!("FastQC {label}"));
         // -D/-R/-S take paths relative to CWD (the -o flag is ignored), so pass absolute qc/ paths

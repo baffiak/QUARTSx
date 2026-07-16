@@ -1,7 +1,7 @@
 // All noodles BAM/SAM I/O lives here so the (fast-moving) noodles API surface is in one place.
 //
-// BGZF codec (§1 / §3 build-spec): the on-disk checkpoints (`{project}.filtered.bam`,
-// `{project}.tagged.bam`) are written through `BgzfW` and checkpoint 2 is read back through `BgzfR`.
+// BGZF codec: the on-disk checkpoints (`{project}.filtered.bam`,
+// `{project}.tagged.bam`) are written through `BgzfW` and checkpoints are read back through `BgzfR`.
 // Each is multithreaded for T>1 and single-threaded for T<=1 (a `threads` argument of 0 selects the
 // single-threaded branch — no worker/write/reader threads). Every branch keeps noodles' DEFAULT
 // codec (level-6), so the compressed bytes are IDENTICAL regardless of branch/worker count: BGZF
@@ -22,9 +22,7 @@ use std::io::{BufWriter, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-const PHRED_OFFSET: u8 = 33;
-
-/// Clamp a thread count to a valid worker count (>= 1) for the noodles multithreaded BGZF codecs.
+/// Clamp a thread count to a valid worker count (>= 1) for the multithreaded BGZF codecs.
 fn worker_count(n: usize) -> NonZeroUsize {
     // Safe: max(1) guarantees a non-zero value.
     NonZeroUsize::new(n.max(1)).expect("n.max(1) >= 1")
@@ -101,7 +99,7 @@ impl Read for BgzfR {
     }
 }
 
-/// SINGLE authority for the filtered-shard checkpoint name (§1). The orchestrator and the filter
+/// SINGLE authority for the filtered-shard checkpoint name. The orchestrator and the filter
 /// stage both call this — NEVER `format!` a shard path inline.
 ///   n == 1  -> dir/{project}.filtered.bam        (COMMON path: no numeric suffix, no `shard_` prefix)
 ///   n  > 1  -> dir/{project}.filtered.{i}.bam     (internal-only, when N parallel STAR jobs are used)
@@ -125,7 +123,7 @@ fn build_record(name: &[u8], flags: u16, seq: &[u8], qual_ascii: &[u8]) -> Recor
     *rec.name_mut() = Some(name.to_vec().into());
     *rec.flags_mut() = Flags::from(flags);
     *rec.sequence_mut() = Sequence::from(seq.to_vec());
-    let phred: Vec<u8> = qual_ascii.iter().map(|&q| q.saturating_sub(PHRED_OFFSET)).collect();
+    let phred: Vec<u8> = qual_ascii.iter().map(|&q| q.saturating_sub(crate::PHRED_OFFSET)).collect();
     *rec.quality_scores_mut() = QualityScores::from(phred);
     rec
 }
@@ -184,8 +182,7 @@ impl ShardSet {
         bc: &str,
         ub: &str,
     ) -> Result<()> {
-        // Barcode+UMI ride as native SAM tags (BC:Z / UB:Z, UB empty on internal reads); STAR copies
-        // input tags through to the aligned BAM, so both mates keep the identical read name.
+        // Barcode+UMI ride as native SAM tags (BC:Z / UB:Z, UB empty on internal reads).
         // 77  = paired|unmapped|mate-unmapped|first  (0x1|0x4|0x8|0x40)
         // 141 = paired|unmapped|mate-unmapped|second (0x1|0x4|0x8|0x80)
         let mut r1 = build_record(name, 77, r1_seq, r1_qual);
@@ -259,8 +256,7 @@ impl TaggedWriter {
         Ok(TaggedWriter { inner, header: header.clone() })
     }
 
-    /// Adds GE/GI string tags to a record (empty = no exon/intron assignment). BC/UB were carried
-    /// through the mapping by STAR, so the record already keeps them.
+    /// Adds GE/GI string tags to a record (empty = no exon/intron assignment).
     pub fn write(&mut self, rec: &mut RecordBuf, ge: &str, gi: &str) -> Result<()> {
         let data = rec.data_mut();
         data.insert(Tag::from([b'G', b'E']), Value::String(ge.as_bytes().into()));
@@ -296,7 +292,7 @@ pub fn seq_len(rec: &RecordBuf) -> usize {
     rec.sequence().len()
 }
 
-/// Reads a BAM string (Z) tag, e.g. BC/UB carried through from the uBAM by STAR.
+/// Reads a BAM string (Z) tag (e.g. BC/UB).
 pub fn tag_string(rec: &RecordBuf, tag: [u8; 2]) -> Option<String> {
     match rec.data().get(&Tag::from(tag)) {
         Some(Value::String(s)) => Some(String::from_utf8_lossy(s.as_ref()).into_owned()),
@@ -320,10 +316,8 @@ pub fn tag_int(rec: &RecordBuf, tag: [u8; 2]) -> Option<i64> {
 /// Reference intervals (1-based inclusive) covered by aligned read bases (M/=/X); D and N advance
 /// the reference cursor but are not counted as covered.
 ///
-/// NOTE (§5 insert-size): this stays a pure GENOMIC-block accessor. Transcript-space projection of
-/// these blocks (the actual insert-size fix) is NOT done here — it lives in `gtf.rs`
-/// (`Gene::project_transcript_span`) and the length calc in `count.rs`, to avoid a cross-file
-/// collision on this shared accessor.
+/// This is a pure GENOMIC-block accessor. Transcript-space projection of these blocks lives in
+/// `gtf.rs` (`Gene::project_transcript_span`) and the length calc in `count.rs`.
 pub fn covered_blocks(rec: &RecordBuf, start_pos: i64) -> Vec<(i64, i64)> {
     use noodles::sam::alignment::record::cigar::op::Kind;
     let mut blocks = Vec::new();

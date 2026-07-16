@@ -1,8 +1,6 @@
 use crate::config::ReadFiltering;
 use anyhow::{Context, Result};
 
-const PHRED_OFFSET: u8 = 33;
-
 pub struct TrimParams {
     pub adapters: Vec<Vec<u8>>,
     pub quality: u8,
@@ -34,7 +32,7 @@ fn read_fasta_seqs(path: &str) -> Result<Vec<Vec<u8>>> {
 
 #[inline]
 fn phred(q: u8) -> u8 {
-    q.saturating_sub(PHRED_OFFSET)
+    q.saturating_sub(crate::PHRED_OFFSET)
 }
 
 /// Adapter clip -> both-ends quality trim -> 4 bp sliding window, all at `quality`.

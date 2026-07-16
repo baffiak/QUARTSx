@@ -12,7 +12,7 @@ pub struct Config {
     pub star_tmp: String,
     pub num_threads: usize,
     pub mem_limit: usize,
-    // §1 thread knobs. T = num_threads; the FILTERING pipeline overlaps N filter/encode workers with
+    // Thread knobs. T = num_threads; the FILTERING pipeline overlaps N filter/encode workers with
     // P BGZF deflaters, so the two concurrent pools must satisfy N + P <= T to avoid oversubscription.
     // Both default (None) => P = T/2, N = T - P. See resolved_threads().
     #[serde(default)]
@@ -96,7 +96,7 @@ pub struct CountingOpts {
     pub downsampling: String,
     pub multi_overlap: bool,
     pub fraction_overlap: f64,
-    // §4 multimapper handling. Mode selects the STARsolo --soloMultiMappers resolution strategy.
+    // Multimapper handling. Mode selects the STARsolo --soloMultiMappers resolution strategy.
     #[serde(default)]
     pub multi_mappers: MultiMapperMode,
     // Multimapper cap for the resolver modes (Uniform/Rescue/PropUnique/EM). Ignored when
@@ -109,9 +109,9 @@ fn default_multimap_nmax() -> u32 {
     20
 }
 
-/// STARsolo `--soloMultiMappers` multi-gene resolution mode (§4). Serde parses the bare mode name
+/// STARsolo `--soloMultiMappers` multi-gene resolution mode. Serde parses the bare mode name
 /// straight from YAML (e.g. `multi_mappers: EM`). The five modes are Unique, Uniform, Rescue,
-/// PropUnique, EM; distribution formulas live in count.rs (§4).
+/// PropUnique, EM; distribution formulas live in count.rs.
 #[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MultiMapperMode {
     Unique,
@@ -256,7 +256,7 @@ impl Config {
     }
 
     /// Resolve the FILTERING thread split into `(P, N)` = (BGZF deflaters, filter/encode workers).
-    /// Defaults per §1: `P = compress_threads.unwrap_or(T/2)`, `N = filter_threads.unwrap_or(T-P)`.
+    /// Defaults: `P = compress_threads.unwrap_or(T/2)`, `N = filter_threads.unwrap_or(T-P)`.
     /// Both pools run CONCURRENTLY, so the invariant `N + P <= T` is enforced here (never oversubscribe
     /// the allocated cores); each pool is kept >= 1. If an explicit split would exceed T, P is trimmed
     /// first (BGZF deflate overlaps its ordered write thread and tolerates fewer cores better than the
@@ -287,14 +287,14 @@ pub fn load(path: &str) -> Result<Config> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     let mut cfg: Config = serde_yaml::from_str(&text).context("parsing config yaml")?;
     cfg.config_path = path.to_string();
-    // §6 Config UX: expand `~` / `$HOME` in ALL path fields BEFORE validate() so existence checks,
+    // Expand `~` / `$HOME` in ALL path fields BEFORE validate() so existence checks,
     // FIFO probing and every downstream consumer (orchestrator, filter, count) see absolute paths.
     expand_paths(&mut cfg);
     validate(&cfg)?;
     Ok(cfg)
 }
 
-/// Expand a leading `~` / `~/` and `$HOME` / `${HOME}` in a single path string (§6). Non-path YAML
+/// Expand a leading `~` / `~/` and `$HOME` / `${HOME}` in a single path string. Non-path YAML
 /// (e.g. STAR params) is not passed through here. Empty strings and paths with no marker pass through
 /// unchanged. Shell-only forms (`~user`, arbitrary `$VARS`) are intentionally NOT expanded — only the
 /// two documented markers, so behavior is identical across macOS / WSL2 / Linux.
@@ -319,8 +319,14 @@ fn expand_path(s: &str) -> String {
     out
 }
 
-// Apply expand_path to every path-valued field (§6). Kept in one place so the set of expanded fields
+// Apply expand_path to every path-valued field. Kept in one place so the set of expanded fields
 // is auditable; orchestrator/filter/count consume the already-expanded paths and never re-expand.
+fn expand_opt(field: &mut Option<String>) {
+    if let Some(s) = field {
+        *s = expand_path(s);
+    }
+}
+
 fn expand_paths(cfg: &mut Config) {
     cfg.out_dir = expand_path(&cfg.out_dir);
     cfg.star_tmp = expand_path(&cfg.star_tmp);
@@ -330,13 +336,9 @@ fn expand_paths(cfg: &mut Config) {
     cfg.sequence_files.file4.name = expand_path(&cfg.sequence_files.file4.name);
     cfg.reference.star_index = expand_path(&cfg.reference.star_index);
     cfg.reference.gtf_file = expand_path(&cfg.reference.gtf_file);
-    if let Some(af) = cfg.reference.additional_files.take() {
-        cfg.reference.additional_files = Some(expand_path(&af));
-    }
+    expand_opt(&mut cfg.reference.additional_files);
     cfg.barcodes.index_table = expand_path(&cfg.barcodes.index_table);
-    if let Some(af) = cfg.read_filtering.adapter_fasta.take() {
-        cfg.read_filtering.adapter_fasta = Some(expand_path(&af));
-    }
+    expand_opt(&mut cfg.read_filtering.adapter_fasta);
 }
 
 fn validate(cfg: &Config) -> Result<()> {
@@ -382,7 +384,7 @@ fn validate(cfg: &Config) -> Result<()> {
         bail!("BC slice on I2 is {i5_seg_len} bp but i5_index column is {} bp", dims.i5_len);
     }
 
-    // §1 thread knobs: an EXPLICIT split that oversubscribes the cores is a config error, caught here
+    // An EXPLICIT split that oversubscribes the cores is a config error, caught here
     // (resolved_threads() also clamps defensively, but an explicit N+P>T is worth a clear message).
     if cfg.num_threads == 0 {
         bail!("num_threads must be >= 1");

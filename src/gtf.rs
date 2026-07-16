@@ -41,7 +41,7 @@ impl Gene {
     /// Strand only applies the order-reversing affine map `off = len - 1 - fwd` (see
     /// `add_coverage`); that is a reflection, so it leaves the span WIDTH `tmax - tmin + 1`
     /// invariant. We therefore return forward-strand transcript coordinates and let the caller
-    /// (`count.rs`) take `tmax - tmin + 1` as the transcript-space fragment length (§5). Measuring
+    /// (`count.rs`) take `tmax - tmin + 1` as the transcript-space fragment length. Measuring
     /// in transcript space collapses introns to zero span; a distant/discordant mate projects onto
     /// ~no exon of this gene, so it cannot inflate the length.
     pub fn project_transcript_span(
@@ -93,6 +93,23 @@ fn attr(attrs: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Sort intervals and coalesce those that overlap or are adjacent (gap <= 1) into a
+/// minimal set of disjoint intervals sorted ascending.
+fn merge_intervals(mut intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    intervals.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 + 1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
 pub fn build(gtf: &str, introns: bool) -> Result<Annotation> {
     let text = std::fs::read_to_string(gtf).with_context(|| format!("reading GTF {gtf}"))?;
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -129,18 +146,8 @@ pub fn build(gtf: &str, introns: bool) -> Result<Annotation> {
 
     // builds are in first-appearance order, so gene indices stay stable
     let mut genes = Vec::with_capacity(builds.len());
-    for mut b in builds {
-        b.exons.sort_unstable();
-        let mut merged: Vec<(i64, i64)> = Vec::new();
-        for &(s, e) in &b.exons {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 + 1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
-            }
-            merged.push((s, e));
-        }
+    for b in builds {
+        let merged = merge_intervals(b.exons);
         let length = merged.iter().map(|&(s, e)| e - s + 1).sum();
         genes.push(Gene {
             id: b.id,
@@ -192,19 +199,9 @@ fn build_intron_tree(genes: &[Gene]) -> HashMap<String, Tree> {
     }
 
     let mut per_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
-    for (chrom, mut exs) in exons_by_chrom {
+    for (chrom, exs) in exons_by_chrom {
         // union of all exons on the chrom -> gaps between them are candidate introns
-        exs.sort_unstable();
-        let mut union: Vec<(i64, i64)> = Vec::new();
-        for (s, e) in exs {
-            if let Some(last) = union.last_mut() {
-                if s <= last.1 + 1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
-            }
-            union.push((s, e));
-        }
+        let union = merge_intervals(exs);
         let mut gaps: Vec<(i64, i64)> = Vec::new();
         for w in union.windows(2) {
             let (gs, ge) = (w[0].1 + 1, w[1].0 - 1);

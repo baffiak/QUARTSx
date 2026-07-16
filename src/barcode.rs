@@ -59,7 +59,7 @@ fn comp(b: u8) -> u8 {
 
 /// Reverse-complement `seq` into `dst` (cleared first); any non-ACGT base becomes 'N'.
 /// Allocation-free when `dst` already has capacity — the hot path hands in per-worker scratch so
-/// the orientation flip costs no per-read heap traffic (§1 alloc-churn fix).
+/// the orientation flip costs no per-read heap traffic.
 #[inline]
 pub fn revcomp_into(seq: &[u8], dst: &mut Vec<u8>) {
     dst.clear();
@@ -68,7 +68,7 @@ pub fn revcomp_into(seq: &[u8], dst: &mut Vec<u8>) {
 }
 
 /// Reverse complement over ACGT; any non-ACGT base becomes 'N'. Convenience allocator over
-/// `revcomp_into` (kept for tests and the cold orientation-vote path).
+/// `revcomp_into`, used by the cold orientation-vote path and tests.
 pub fn revcomp(seq: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(seq.len());
     revcomp_into(seq, &mut v);
@@ -133,8 +133,8 @@ impl IndexList {
         if codes.is_empty() {
             bail!("empty index list");
         }
-        // Uniform-length guard (local only; the length is not stored — decode() packs windows of
-        // any L<=32 and never validates against a stored column length, so the field was dead).
+        // Uniform-length guard. The column length is not stored — decode() packs windows of any
+        // L<=32 without validating against a stored length.
         let len = codes[0].len();
         for c in &codes {
             if c.len() != len {
@@ -205,7 +205,7 @@ impl IndexList {
 
     /// Full decode outcome — distinguishes an exact hit, a sphere-corrected hit, an ambiguous
     /// REJECT-sentinel window, and a plain miss, and reports the exact-vs-corrected flag inline so
-    /// `assign_into` needs no separate `exact_hit` re-pack (§1) and can split drop reasons (§6).
+    /// `assign_into` needs no separate `exact_hit` re-pack and can split drop reasons.
     #[inline]
     fn decode_full(&self, obs: &[u8]) -> Decode {
         let k = match pack(obs) {
@@ -341,8 +341,7 @@ struct ParsedTable {
 
 /// Table dimensions for config-time validation (charset/length/columns checked here).
 /// Only the two column lengths are surfaced — config::validate cross-checks them against the BC
-/// slice geometry. The row/index counts (`n_i7`/`n_i5`/`n_pairs`) were never read by any consumer
-/// and were removed (§6 dead-code cleanup); tests that need those counts call `parse_table`.
+/// slice geometry.
 pub struct TableDims {
     pub i7_len: usize,
     pub i5_len: usize,
@@ -373,8 +372,8 @@ fn detect_delim(header: &str) -> Result<char> {
 
 fn parse_table(path: &str) -> Result<ParsedTable> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading index table {path}"))?;
-    // Strip a leading UTF-8 BOM (Excel on Windows/European locale writes one). str::trim() does
-    // NOT remove U+FEFF (it has White_Space=No), so it would otherwise glue onto header[0].
+    // Strip a leading UTF-8 BOM if present. str::trim() does NOT remove U+FEFF (White_Space=No),
+    // so it would otherwise glue onto header[0].
     let text = text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text);
 
     // Defensive line splitting: split on either \n or \r (handles \n, \r\n, and bare-\r files),
@@ -475,7 +474,7 @@ pub struct IndexTable {
     pub i5: IndexList,
     /// Valid (i7_id, i5_id) pairs → pair ordinal. Key packed ((i7_id as u64) << 32) | i5_id.
     /// The ordinal indexes `labels`; it is also returned to callers as a compact integer barcode id
-    /// so the hot path can carry a `u32` instead of re-hashing a string (§1 alloc-churn fix).
+    /// so the hot path can carry a `u32` instead of re-hashing a string.
     pairs: HashMap<u64, u32>,
     /// Interned `i7 ++ i5` label per valid pair, built ONCE at load. `assign_into` hands back a
     /// borrow of the ready string — no per-read `format!` concatenation.
@@ -502,7 +501,7 @@ impl RevcompScratch {
 }
 
 /// Why a read could not be assigned to a cell — lets `filter.rs` split its `no_barcode` bucket into
-/// absent/uncorrectable vs ambiguous-reject for drop-reason reporting (§6). `AmbiguousReject` is the
+/// absent/uncorrectable vs ambiguous-reject for drop-reason reporting. `AmbiguousReject` is the
 /// distinct, scientifically-meaningful case: the read window is correctable-distance from >=2 listed
 /// indexes, so the sphere holds a REJECT sentinel and we refuse to guess (never mis-assign).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -601,8 +600,8 @@ impl IndexTable {
     /// `scratch`, so a Forward column borrows the raw window with ZERO copies and a RevComp column
     /// reuses the scratch buffer), validate the pair, and hand back the interned label + pair id.
     ///
-    /// Zero per-read heap allocation on the assign path (§1): no revcomp `Vec` churn, no `format!`.
-    /// The decode reason is preserved so `filter.rs` can split drop reasons (§6):
+    /// Zero per-read heap allocation on the assign path: no revcomp `Vec` churn, no `format!`.
+    /// The decode reason is preserved so `filter.rs` can split drop reasons:
     /// a REJECT-sentinel hit (ambiguous, reachable from >=2 indexes in the Sequence-Levenshtein
     /// sphere) is `AmbiguousReject`; anything else non-assigned is `Absent`
     /// (plain miss) or `InvalidPair` (both indexes real, combination not a listed cell).
@@ -740,7 +739,7 @@ pub fn resolve_orientation(v: &Vote, which: &str) -> Result<Orient> {
 }
 
 // ----------------------------------------------------------------------------
-// Kept unchanged: fixed-position Hamming of R1's first bases against the TSO tag.
+// TSO tag detection
 // ----------------------------------------------------------------------------
 
 /// Fixed-position Hamming (NOT edit distance) of R1's first bases against the TSO tag.
@@ -912,7 +911,7 @@ mod tests {
     #[test]
     fn orient_near_even_tie_errors() {
         // discrim=200 (>= MIN_DISCRIM) but an exact 100/100 split: must error "mixed", never
-        // silently resolve to Forward via the old minor<MIN_DISCRIM hole.
+        // silently resolve to Forward.
         let v = Vote { fwd: 100, rc: 100, ambig: 0, unmatched: 0 };
         assert!(resolve_orientation(&v, "i7").is_err());
         // Slight majority still under the dominance floor -> still mixed.
@@ -935,7 +934,7 @@ mod tests {
         let d = probe_table(&path).unwrap();
         assert_eq!(d.i7_len, 10);
         assert_eq!(d.i5_len, 10);
-        // row/index counts now come from the full parser (TableDims dropped its count fields).
+        // row/index counts come from the full parser (TableDims exposes only the two lengths).
         let t = parse_table(&path).unwrap();
         assert_eq!(t.i7.len(), 2);
         assert_eq!(t.i5.len(), 1);
@@ -1055,7 +1054,7 @@ mod tests {
         assert!(IndexList::build(vec!["ACGTACGTAC".into(), "ACGTACGTAC".into()], BUDGET).is_err());
     }
 
-    // ---- assign_into: low-alloc path + drop-reason split (§1/§6) ----
+    // ---- assign_into: low-alloc path + drop-reason split ----
     #[test]
     fn assign_into_reasons_split() {
         // i7 has two Hamming-distance-2 codes so "AAAAAAAAAC" is a shared 1-sub window -> REJECT.

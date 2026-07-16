@@ -1,15 +1,14 @@
 use crate::bam::{self, BamReader, TaggedWriter};
 use crate::config::{Config, MultiMapperMode};
 use crate::gtf::{Annotation, Gene, Tree};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use coitrees::IntervalTree;
 use noodles::sam::alignment::RecordBuf;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::fs::File;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 pub const NONE: u32 = u32::MAX;
@@ -17,8 +16,7 @@ pub const NONE: u32 = u32::MAX;
 // gene-body 5'->3' coverage resolution
 const NBINS: usize = 100;
 
-// records processed between two heartbeat checks (internal gate only — NOT a printed record count;
-// the old "N M records annotated" counter that exceeded the read count is removed per §3).
+// records processed between two heartbeat checks (internal gate only, not a printed record count).
 const BEAT_EVERY: u64 = 262_144;
 
 const BATCH: usize = 32_768;
@@ -28,7 +26,7 @@ pub struct Row {
     pub umi: Vec<u8>, // empty on internal reads
     pub ge: u32,      // exon gene-set id or NONE
     pub gi: u32,      // intron gene-set id or NONE
-    pub uniq: bool,   // uniquely mapped (NH==1)? drives unique-evidence-first molecule base (§4a)
+    pub uniq: bool,   // uniquely mapped (NH==1)? drives unique-evidence-first molecule base
 }
 
 // read-type taxonomy per cell (mapped fragments; unmapped is derived from filter totals later)
@@ -72,9 +70,8 @@ impl ReadTable {
 
 // A fragment being assembled from its mate(s) / multimapping loci. Holds ONLY currently-open
 // fragments — for a unique (NH==1) concordant pair this is just mate1 until mate2 arrives, so the
-// resident set is bounded by local coverage, NOT by the genome-wide read count. This is what makes
-// the old 40 GB global name-keyed `assign` map unnecessary (§3): tagging is fused into the counting
-// pass, so no name->gene map has to survive to a second pass.
+// resident set is bounded by local coverage, not by the genome-wide read count. Tagging is fused
+// into the counting pass, so no name->gene map has to survive to a second pass.
 struct OpenFrag {
     name: Vec<u8>,
     exon_ov: Vec<(u32, i64)>,
@@ -85,7 +82,7 @@ struct OpenFrag {
     r2_rev: Option<bool>,
     bc: String,
     ub: String,
-    is_multi: bool,          // NH>1 at any record: gene set is the UNION across loci (§4)
+    is_multi: bool,          // NH>1 at any record: gene set is the UNION across loci
     have_r1_primary: bool,   // completion tracking for the unique concordant fast path
     have_r2_primary: bool,
     recs: Vec<RecordBuf>,    // the actual records to write to the tagged BAM (both mates / all loci)
@@ -133,7 +130,7 @@ impl OpenFrag {
     }
 
     // absorb another OpenFrag with the same read name (a cross-contig mate rejoined in the leftover
-    // pass). Keep this (earlier-seen) frag's bc/ub — the first-seen-mate convention is unchanged.
+    // pass). Keep this (earlier-seen) frag's bc/ub, per the first-seen-mate convention.
     fn absorb(&mut self, other: OpenFrag) {
         for (g, l) in other.exon_ov {
             add(&mut self.exon_ov, g, l);
@@ -236,11 +233,11 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
     // Checkpoint 2 — STAR's own coordinate-sorted output name (lowercase `sorted`, cap `Coord`).
     let input = star_dir.join(format!("{}.Aligned.sortedByCoord.out.bam", cfg.project));
     // Checkpoint 3 is written unsorted (fragments finalize out of coordinate order because a mate's
-    // gene can only be resolved once BOTH mates are seen), then samtools-sorted — "STAR's way" (§3).
+    // gene can only be resolved once BOTH mates are seen), then samtools-sorted.
     let unsorted = star_dir.join(format!("{}.tagged.unsorted.bam", cfg.project));
     let tagged = star_dir.join(format!("{}.tagged.bam", cfg.project));
 
-    // P deflate/inflate workers for the BGZF reader+writer (§3 parallel I/O). At T<=1 take the
+    // P deflate/inflate workers for the BGZF reader+writer. At T<=1 take the
     // single-threaded path: io_threads == 0 selects the single-threaded BGZF codec and the annotation
     // runs serially (no rayon fan-out), so one working thread never oversubscribes the lone core. For
     // T>1 the global rayon pool (num_threads) drives the annotation and these are its codec pools.
@@ -252,7 +249,7 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
     let mut reader = BamReader::open(&input, io_threads)?;
     let ref_names: Vec<String> = reader.ref_names.clone();
 
-    // genome-position progress denominator (§3 progress bar). reference_sequences() is an IndexMap in
+    // genome-position progress denominator. reference_sequences() is an IndexMap in
     // ref_id order, so values() line up with ref_names / bam::ref_id indices.
     let ref_lengths: Vec<u64> = reader
         .header
@@ -271,12 +268,10 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
 
     let mut state = CountState::new();
     state.ref_names = ref_names.clone();
-    state.additional_chroms =
-        ann.genes.iter().filter(|g| g.additional).map(|g| g.chrom.clone()).collect();
 
     let mut writer = TaggedWriter::create(&unsorted, &reader.header, io_threads)?;
 
-    // Per-CONTIG pending (invariant 5): unique concordant pairs whose second mate has not yet arrived.
+    // Per-CONTIG pending: unique concordant pairs whose second mate has not yet arrived.
     // Freed at every contig boundary — a >100 kb intron keeps a pair open within a contig (fine), only
     // genuine cross-contig/singleton mates survive to `leftover`.
     let mut pending: HashMap<Vec<u8>, OpenFrag> = HashMap::new();
@@ -284,7 +279,6 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
     let mut leftover: HashMap<Vec<u8>, OpenFrag> = HashMap::new();
     // multimapping fragments (NH>1) — their loci are scattered across the genome, so they cannot be
     // paired within one contig; accumulate the full UNION here and finalize in the leftover pass.
-    // In the default Unique mode STAR emits no NH>1 records, so this stays empty.
     let mut multi: HashMap<Vec<u8>, OpenFrag> = HashMap::new();
     let mut current_rid: Option<usize> = None;
 
@@ -320,8 +314,7 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
                 }
                 _ => (Vec::new(), 0),
             };
-            // BC/UB were passed through the mapping by STAR (empty UB => internal read); only the
-            // first-seen mate's copy is used at insert time, exactly as before.
+            // empty UB => internal read; only the first-seen mate's copy is used at insert time.
             let bc = bam::tag_string(&rec, [b'B', b'C']).unwrap_or_default();
             let ub = bam::tag_string(&rec, [b'U', b'B']).unwrap_or_default();
             let nh = bam::tag_int(&rec, [b'N', b'H']).unwrap_or(1);
@@ -360,7 +353,7 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
         };
 
         for mut a in annotated {
-            // contig boundary: free this contig's pending into the leftover pass (invariant 5).
+            // contig boundary: free this contig's pending into the leftover pass.
             if let Some(rid) = a.rid {
                 if current_rid != Some(rid) {
                     flush_pending(&mut pending, &mut leftover);
@@ -420,8 +413,8 @@ pub fn count(cfg: &Config, ann: &Annotation, stage: &crate::log::Stage) -> Resul
 
     writer.finish()?;
 
-    // "Merge = STAR's way": the unsorted tagged BAM -> samtools sort -@T -> coordinate-sorted, indexable
-    // checkpoint 3; then drop the intermediate so exactly ONE ~90 GB checkpoint remains (§3 IMPL NOTE).
+    // samtools sort the unsorted tagged BAM -@T into a coordinate-sorted, indexable checkpoint 3;
+    // then drop the intermediate so exactly ONE ~90 GB checkpoint remains.
     stage.step("counting: samtools sort tagged BAM");
     samtools_sort(&unsorted, &tagged, cfg.num_threads, &out.join("logs"))?;
 
@@ -463,21 +456,9 @@ fn finalize_and_write(
 fn samtools_sort(unsorted: &Path, sorted: &Path, threads: usize, logs: &Path) -> Result<()> {
     std::fs::create_dir_all(logs).ok();
     let logf = logs.join("samtools_sort.tagged.log");
-    let f = File::create(&logf).with_context(|| format!("creating {}", logf.display()))?;
-    let ferr = f.try_clone().with_context(|| format!("cloning {}", logf.display()))?;
-    let status = Command::new("samtools")
-        .args(["sort", "-@", &threads.to_string(), "-o"])
-        .arg(sorted)
-        .arg(unsorted)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(f))
-        .stderr(Stdio::from(ferr))
-        .status()
-        .context("launching samtools sort")?;
-    if !status.success() {
-        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-        bail!("samtools sort of tagged BAM failed (exit {code}); see {}", logf.display());
-    }
+    let mut cmd = Command::new("samtools");
+    cmd.args(["sort", "-@", &threads.to_string(), "-o"]).arg(sorted).arg(unsorted);
+    crate::orchestrator::checked(&mut cmd, "samtools sort", &logf)?;
     std::fs::remove_file(unsorted).ok();
     Ok(())
 }
@@ -487,7 +468,6 @@ struct CountState {
     bc_map: HashMap<String, u32>,
     set_map: HashMap<Vec<u32>, u32>,
     ref_names: Vec<String>,
-    additional_chroms: HashSet<String>,      // contigs from additional_fasta (spike-ins)
     gb_tagged: HashMap<u32, [f64; NBINS]>,   // per-gene 5'->3' profile, UMI-tagged reads
     gb_internal: HashMap<u32, [f64; NBINS]>, // per-gene 5'->3' profile, internal reads
     ins_tagged: HashMap<(bool, i64), u64>,   // insert-size histogram, UMI-tagged, keyed (additional, size)
@@ -501,7 +481,6 @@ impl CountState {
             bc_map: HashMap::new(),
             set_map: HashMap::new(),
             ref_names: Vec::new(),
-            additional_chroms: HashSet::new(),
             gb_tagged: HashMap::new(),
             gb_internal: HashMap::new(),
             ins_tagged: HashMap::new(),
@@ -510,8 +489,7 @@ impl CountState {
     }
 
     // Resolve a fragment's gene set(s), fold its QC, push its per-fragment row, and RETURN the interned
-    // (exon, intron) gene-set ids so the caller can tag the fragment's records. No global name-keyed
-    // map is produced (§3): the assignment is consumed immediately.
+    // (exon, intron) gene-set ids so the caller can tag the fragment's records.
     fn finalize(&mut self, acc: &OpenFrag, cfg: &Config, ann: &Annotation) -> (u32, u32) {
         let tagged = !acc.ub.is_empty();
         let strand = if let Some(r) = acc.r1_rev {
@@ -535,7 +513,7 @@ impl CountState {
             }
         }
 
-        // insert size (§5): TRANSCRIPT-SPACE span, not genomic. Requires a single resolved gene
+        // insert size: TRANSCRIPT-SPACE span, not genomic. Requires a single resolved gene
         // (ge_genes.len()==1) and both mapped mates; each mate's aligned blocks are projected onto the
         // gene's exon-union transcript coordinate (introns collapse, a distant mate projects onto ~no
         // exon so it cannot inflate), and the span is tmax-tmin+1. Category from gene.additional.
@@ -686,7 +664,7 @@ fn write_insertsize(
 }
 
 // Returns (winning genes, was_ambiguous).
-// - `multimapper` (NH>1): the gene set is the UNION across the read's loci (§4) — every distinct gene
+// - `multimapper` (NH>1): the gene set is the UNION across the read's loci — every distinct gene
 //   with a real overlap (strand-filtered), never "ambiguous". Distribution across the set is handled
 //   downstream by `write_multimapper_matrices` (normalize over |ug|, never over NH).
 // - unique: best-overlap gene(s) passing the fraction gate; a >1-gene tie is ambiguous unless
@@ -799,7 +777,7 @@ fn add(v: &mut Vec<(u32, i64)>, g: u32, len: i64) {
     v.push((g, len));
 }
 
-// gene_names.txt CARRIES a header row now (§6): `gene_id\tgene_name`.
+// gene_names.txt carries a header row: `gene_id\tgene_name`.
 fn write_gene_names(out: &Path, ann: &Annotation, project: &str) -> Result<()> {
     let dir = out.join("expression");
     std::fs::create_dir_all(&dir).context("creating expression/")?;
@@ -822,13 +800,22 @@ fn mode_label(m: MultiMapperMode) -> &'static str {
     }
 }
 
+// Split a multi-gene unit's count evenly across its genes into `dst` (the uniform fallback used
+// whenever a mode has no unique-anchor weight to prorate by).
+fn add_uniform(dst: &mut BTreeMap<u32, f64>, genes: &[u32], c: f64) {
+    let inv = c / genes.len() as f64;
+    for &g in genes {
+        *dst.entry(g).or_default() += inv;
+    }
+}
+
 /// Distribute multi-gene units across their genes per the selected `--soloMultiMappers` mode and
 /// write the resulting MULTI-ONLY mass into the counts.tsv.gz handoff (quant = `<family>_mult_<mode>`)
 /// for the given feature/level.
 ///
 /// Called from dedup::collapse per LAYER and LEVEL, once per FAMILY (`umicount`=tagged molecules,
 /// `readcount_internal`=internal fragments), so the resolver mirrors the integer matrix on every
-/// axis (§4). `counts[(bc, gene set)]` is the collapsed count for a (cell, gene-set) — molecules on
+/// axis. `counts[(bc, gene set)]` is the collapsed count for a (cell, gene-set) — molecules on
 /// the INTERSECTED set for tagged, internal fragments on the per-fragment set for internal. The
 /// always-emitted integer unique-gene matrix `gEu` is dedup's standard integer block; `gEu +
 /// <family>_mult_<mode>` reconstructs the `UniqueAndMult-<mode>` matrix.
@@ -843,7 +830,7 @@ fn mode_label(m: MultiMapperMode) -> &'static str {
 ///                count(S)·θ_old[g]/Σ_{h∈S}θ_old[h]; prune θ_new<0.01 -> 0; stop at maxAbsChange<0.01
 ///                or after 100 iters
 /// The published mass is the distributed MULTI portion only (EM = θ_final − gEu). Normalization is
-/// ALWAYS over the number of distinct written genes |ug|, NEVER over NH (§4). Determinism: cells in
+/// ALWAYS over the number of distinct written genes |ug|, NEVER over NH. Determinism: cells in
 /// bc-id order, per-set genes ascending, fixed EM iters/tolerance -> byte-identical run to run.
 pub fn write_multimapper_matrices(
     w: &mut impl std::io::Write,
@@ -875,10 +862,7 @@ pub fn write_multimapper_matrices(
             if genes.len() == 1 {
                 *geu.entry(genes[0]).or_default() += c;
             } else if genes.len() > 1 {
-                let inv = c / genes.len() as f64;
-                for &g in genes {
-                    *guni.entry(g).or_default() += inv;
-                }
+                add_uniform(&mut guni, genes, c);
                 multis.push((genes, c));
             }
         }
@@ -903,10 +887,7 @@ pub fn write_multimapper_matrices(
                             }
                         }
                     } else {
-                        let inv = c / genes.len() as f64;
-                        for &g in *genes {
-                            *mass.entry(g).or_default() += inv;
-                        }
+                        add_uniform(&mut mass, genes, *c);
                     }
                 }
             }
@@ -924,10 +905,7 @@ pub fn write_multimapper_matrices(
                             }
                         }
                     } else {
-                        let inv = c / genes.len() as f64;
-                        for &g in *genes {
-                            *mass.entry(g).or_default() += inv;
-                        }
+                        add_uniform(&mut mass, genes, *c);
                     }
                 }
             }
@@ -952,10 +930,7 @@ pub fn write_multimapper_matrices(
                                 }
                             }
                         } else {
-                            let inv = c / genes.len() as f64;
-                            for &g in *genes {
-                                *theta_new.entry(g).or_default() += inv;
-                            }
+                            add_uniform(&mut theta_new, genes, *c);
                         }
                     }
                     for v in theta_new.values_mut() {

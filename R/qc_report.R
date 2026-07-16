@@ -99,8 +99,8 @@ name_or <- function(x, alt = "none") {
 ## (1) run summary: reference inputs (top), filtered stats (mid), setup (bottom)
 # top: reference file names
 ref_rows <- kv("Genome (STAR index)", "n/a")
-# mid: filter stats — read the scalar metrics TSV from the QC folder (relocated there from
-# filtered/, since the filter stats table is QC output). Two columns: metric<TAB>value.
+# mid: filter stats — read the scalar metrics TSV from the QC folder.
+# Two columns: metric<TAB>value.
 fs_path <- file.path(qc_dir, "filter_stats.tsv")
 fs <- list()
 if (file.exists(fs_path)) {
@@ -171,7 +171,7 @@ if (nzchar(config_path) && file.exists(config_path)) {
     kv("Genome (STAR index)", name_or(y$reference$STAR_index)),
     kv("Annotation (GTF)",    name_or(y$reference$GTF_file)),
     kv("Additional files",    name_or(y$reference$additional_files)))
-  # quartsx.sh accepts ONLY -y <config>; the previously shown -c flag never existed (spec §6).
+  # quartsx.sh accepts ONLY -y <config>.
   cmd_html <- sprintf("<p class='cmd'><code>quartsx.sh -y %s</code></p>", esc(config_path))
   setup_items <- c(setup_items,
     `Start stage`      = name_or(y$start_stage),
@@ -295,7 +295,7 @@ facet_cats <- function(d) intersect(cat_levels, unique(d$category))
 # percentile, 5'->3'); here we only plot it. The y-axis is FREED per facet via
 # ggh4x::facet_grid2(independent="y"): SS3xpress UMI-tagged vs internal reads sit in very different
 # normalised ranges (~0.02-0.72), so a shared 0..1 axis flattened the real shape into a near-flat
-# line. Per-panel free y lets each facet scale to its own data (spec §6).
+# line. Per-panel free y lets each facet scale to its own data.
 cover_html <- ""
 gb_path <- file.path(qc_dir, paste0(project, ".genebody_coverage.txt"))
 if (file.exists(gb_path)) {
@@ -304,7 +304,7 @@ if (file.exists(gb_path)) {
     rts  <- intersect(rt_levels, unique(gb$read_type))
     # drive the category factor from the levels PRESENT in the data (droplevels), so a
     # facet ROW is only rendered for categories that actually occur (no empty Spike-in row
-    # when there are no spike/additional genes) rather than a hardcoded 2-level factor.
+    # when there are no spike/additional genes).
     gb[, category  := droplevels(factor(category, levels = facet_cats(gb)))]
     gb[, read_type := factor(read_type, levels = rts)]
     cats <- levels(gb$category)
@@ -325,9 +325,9 @@ if (file.exists(gb_path)) {
 }
 
 ## (4) insert-size distribution, same category x read_type split as coverage --
-# The upstream insert size is computed in TRANSCRIPT space (exon-union projection, spec §5), so
+# The upstream insert size is computed in TRANSCRIPT space (exon-union projection), so
 # introns are already collapsed and only genuine fragment length remains; discordant/edge cases can
-# still fall outside the plotted window. Plot (spec §5): window to a plausible 100 bp-10 kb range
+# still fall outside the plotted window. Plot: window to a plausible 100 bp-10 kb range
 # (drop <100 and >10 kb BEFORE plotting), scale_x_log10() so the ~250 bp mode is legible instead of
 # squashed against a long tail, geom_area/line instead of geom_col over thousands of 1 bp bins, and
 # y FREED per facet via ggh4x::facet_grid2(independent="y") (a shared y would crush Transcriptome
@@ -337,13 +337,13 @@ is_path <- file.path(qc_dir, paste0(project, ".insertsize.txt"))
 if (file.exists(is_path)) {
   ins <- fread(is_path)
   # window to plausible fragment lengths BEFORE any fraction is computed, so each facet's
-  # fraction integrates over the plotted 100 bp-10 kb window (spec §5).
+  # fraction integrates over the plotted 100 bp-10 kb window.
   ins <- ins[insert_size >= 100 & insert_size <= 10000]
   if (nrow(ins)) {
     rts  <- intersect(rt_levels, unique(ins$read_type))
     # drive the category factor from the levels PRESENT in the data (droplevels), so a
     # facet ROW is only rendered for categories that actually occur (no empty Spike-in row
-    # when there are no spike/additional genes) rather than a hardcoded 2-level factor.
+    # when there are no spike/additional genes).
     ins[, category  := droplevels(factor(category, levels = facet_cats(ins)))]
     ins[, read_type := factor(read_type, levels = rts)]
     cats <- levels(ins$category)

@@ -12,6 +12,8 @@ mod trim;
 use anyhow::{bail, Result};
 use std::time::Instant;
 
+pub const PHRED_OFFSET: u8 = 33;
+
 fn main() {
     let run_start = Instant::now();
     match real_main(run_start) {

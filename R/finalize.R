@@ -9,7 +9,7 @@
 # below is fully generic and every block lands where its labels put it -- no per-quant branch.
 #
 # Integer blocks:  umicount / readcount / readcount_internal / rpkm.
-# Resolver blocks (multimapper DECISION, build-spec §4): for the ONE selected mode
+# Resolver blocks (multimapper resolution): for the ONE selected mode
 # (uniform|rescue|propunique|em) count.rs emits two families that MIRROR the integer matrix on all
 # three axes -- quant `umicount_mult_<mode>` and `readcount_internal_mult_<mode>`, feature in
 # {exon,intron,inex} (whichever layers the integer matrix used), level `all` plus every
@@ -21,7 +21,7 @@
 #
 # NOTE: gene_id<->gene_name mapping lives in out/expression/{project}.gene_names.txt (written with a
 # `gene_id\tgene_name` header by count.rs). finalize.R does NOT read that file -- dgecounts is keyed
-# by gene_id straight from the handoff -- so the added header row is a no-op here.
+# by gene_id straight from the handoff -- so the header row is a no-op here.
 suppressPackageStartupMessages({
   library(data.table)
   library(Matrix)

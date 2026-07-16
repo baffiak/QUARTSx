@@ -9,6 +9,7 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_distr::{Binomial, Distribution};
 use rayon::prelude::*;
+use crate::filter::PerBc;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -19,11 +20,6 @@ use std::path::Path;
 #[derive(Deserialize)]
 struct FilterStatsFile {
     per_barcode: HashMap<String, PerBc>,
-}
-#[derive(Deserialize)]
-struct PerBc {
-    tagged: u64,
-    internal: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -65,7 +61,7 @@ impl Layer {
 
 // Per-UMI accumulator within one cell: read count plus the running INTERSECTION of the per-fragment
 // gene sets of the reads carrying this UMI, kept SEPARATELY by mapping uniqueness so unique evidence
-// can dominate (§4a). `uniq` = intersection over this UMI's uniquely-mapped (NH==1) reads; `multi` =
+// can dominate. `uniq` = intersection over this UMI's uniquely-mapped (NH==1) reads; `multi` =
 // intersection over its multimapping (NH>1) reads. Each is `None` until the first such read; each list
 // stays sorted ascending. The molecule's gene set is taken from `uniq` when present, else `multi`.
 struct UmiAcc {
@@ -75,7 +71,7 @@ struct UmiAcc {
 }
 
 // Per-(layer, level) collapsed tallies. `mol` is the TAGGED family keyed by the molecule's INTERSECTED
-// gene set (§4); `read`/`read_internal` are per-fragment-set fragment tallies (union, no collapse).
+// gene set; `read`/`read_internal` are per-fragment-set fragment tallies (union, no collapse).
 #[derive(Default)]
 struct LayerCounts {
     mol: HashMap<(u32, Vec<u32>), u64>,      // umicount: (bc, intersected gene set) -> molecules
@@ -136,7 +132,7 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::l
     // ---- "all" level ----
     // Each layer emits its integer blocks (umicount/readcount/readcount_internal) AND the STARsolo-mode
     // resolver matrices for BOTH families (umicount=tagged, readcount_internal=internal), mirroring the
-    // integer matrix on every axis (§4). The resolver redistributes multi-gene sets by the mode formula;
+    // integer matrix on every axis. The resolver redistributes multi-gene sets by the mode formula;
     // formulas live in count::write_multimapper_matrices.
     let mut exon_internal: Option<BTreeMap<(u32, u32), f64>> = None;
     for (li, &layer) in layers.iter().enumerate() {
@@ -195,12 +191,12 @@ pub fn collapse(rt: &ReadTable, cfg: &Config, ann: &Annotation, stage: &crate::l
     Ok(())
 }
 
-/// Collapse the rows of one layer into per-(cell, gene-set) tallies (§4).
+/// Collapse the rows of one layer into per-(cell, gene-set) tallies.
 ///  - `read`/`read_internal`: every fragment contributes ONE unit to its per-fragment (UNION) set,
 ///    grouped (bc, set); internal fragments (no UMI) additionally feed `read_internal`. No collapse.
 ///  - `mol` (TAGGED family): each cell's UMI-carrying reads are directional-collapsed into molecules.
 ///    A molecule's gene set is the INTERSECTION of its member reads' per-fragment sets, but UNIQUE
-///    (NH==1) reads dominate (§4a): if a molecule has any uniquely-mapped read its set is the
+///    (NH==1) reads dominate: if a molecule has any uniquely-mapped read its set is the
 ///    intersection of its unique reads only (multimapper reads never alter the integer base and never
 ///    reintroduce ambiguity); only molecules with NO unique read fall back to their multimapper
 ///    intersection. An empty intersection drops the molecule from the layer. Cells are independent, so
@@ -227,7 +223,7 @@ fn collapse_rows<I: Iterator<Item = usize>>(rt: &ReadTable, layer: &Layer, rows:
                 .or_insert_with(|| UmiAcc { count: 0, uniq: None, multi: None });
             a.count += 1;
             // Fold this read into the intersection of its own uniqueness class, keeping unique and
-            // multimapper evidence apart so unique reads can dominate at resolution (§4a).
+            // multimapper evidence apart so unique reads can dominate at resolution.
             let slot = if r.uniq { &mut a.uniq } else { &mut a.multi };
             *slot = Some(match slot.take() {
                 None => genes.to_vec(),
@@ -249,7 +245,7 @@ fn collapse_rows<I: Iterator<Item = usize>>(rt: &ReadTable, layer: &Layer, rows:
 }
 
 /// Directional-collapse one cell's UMIs into molecules. A molecule's gene set is the INTERSECTION of its
-/// member reads' per-fragment sets, with UNIQUE (NH==1) reads dominating (§4a): when the network has any
+/// member reads' per-fragment sets, with UNIQUE (NH==1) reads dominating: when the network has any
 /// uniquely-mapped read the set is the intersection of its unique reads ONLY (multimapper reads are
 /// ignored, so a unique read on gene X is never annihilated by a co-UMI multimapper on {Y,Z}); a network
 /// with no unique read falls back to its multimapper intersection. Empty intersections are dropped.
@@ -312,7 +308,7 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
 }
 
 fn umi_value_map(mol: &HashMap<(u32, Vec<u32>), u64>) -> BTreeMap<(u32, u32), f64> {
-    // gEu = UNIQUE-ONLY INTEGER base (§4): a molecule contributes ONLY when its intersected gene set
+    // gEu = UNIQUE-ONLY INTEGER base: a molecule contributes ONLY when its intersected gene set
     // is exactly one gene. Multi-gene molecules go solely to the `umicount_mult_<mode>` resolver, never
     // here, so `base + umicount_mult_<mode>` reconstructs UniqueAndMult with no double-count. Each
     // single-gene set {g} is one HashMap key, so each (gene, bc) gets one integer add -> order-safe.
@@ -326,7 +322,7 @@ fn umi_value_map(mol: &HashMap<(u32, Vec<u32>), u64>) -> BTreeMap<(u32, u32), f6
 }
 
 fn set_value_map(m: &HashMap<(u32, u32), u64>, rt: &ReadTable) -> BTreeMap<(u32, u32), f64> {
-    // gEu = UNIQUE-ONLY INTEGER base (§4): a fragment contributes ONLY when its per-fragment gene set
+    // gEu = UNIQUE-ONLY INTEGER base: a fragment contributes ONLY when its per-fragment gene set
     // is exactly one gene. Multi-gene (multi-overlap / multimapper) fragments go solely to the
     // `<family>_mult_<mode>` resolver, never the base. Each single-gene set interns to one id, so each
     // (gene, bc) gets one integer add -> order-safe.
@@ -355,7 +351,7 @@ fn emit_level<W: Write>(
 }
 
 /// Emit the STARsolo-mode resolver matrices for one (layer, level) for BOTH families, mirroring the
-/// integer matrix (§4): `umicount` from tagged molecules (INTERSECTED sets), `readcount_internal` from
+/// integer matrix: `umicount` from tagged molecules (INTERSECTED sets), `readcount_internal` from
 /// internal fragments (per-fragment sets). Unique mode emits nothing (resolver early-returns).
 fn emit_resolver<W: Write>(
     w: &mut W,

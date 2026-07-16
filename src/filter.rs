@@ -1,4 +1,4 @@
-//! STAGE: FILTERING — three-stage overlapped pipeline (build-spec §1).
+//! STAGE: FILTERING — three-stage overlapped pipeline.
 //!
 //! Shape (STAR's parallelization shape + QUARTSx order-preserving determinism):
 //!   1. Per-file inflate — one decompressor thread per input FASTQ (R1‖R2 heavy; I1/I2 tiny),
@@ -11,7 +11,7 @@
 //!   3. P-deflater BGZF write via `ShardSet` (its internal `MultithreadedWriter`). The serial drain
 //!      does only routing + the seed-1 QC reservoir + counters + `write_pair`.
 //!
-//! Determinism gate (§1): at a fixed `n_shards`, varying P and N yields identical
+//! Determinism gate: at a fixed `n_shards`, varying P and N yields identical
 //! sha256(`{project}.filtered.bam`) + `filter_stats.*` + QC fastqs. This holds because every
 //! order-sensitive action (shard routing on `passed % n_shards`, the seed-1 reservoir RNG, all
 //! counters) runs SERIALLY in input order on the drain, the rayon collect is order-preserving, and
@@ -32,7 +32,7 @@ use needletail::parse_fastx_reader;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -46,7 +46,7 @@ const BATCH: usize = 32_768; // quads classified per rayon batch (bounds one in-
 const CHUNK: usize = 8_192; // records a reader thread accumulates before sending a chunk
 const CHUNK_CHAN_CAP: usize = 4; // chunks buffered per file (bounds read-ahead memory)
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct PerBc {
     pub tagged: u64,
     pub internal: u64,
@@ -57,7 +57,7 @@ pub struct FilterStats {
     pub total: u64,
     pub passed: u64,
     pub dropped_short_r2: u64,
-    // no_barcode is SPLIT into three non-overlapping sub-reasons (§6). Field names match the
+    // no_barcode is split into three non-overlapping sub-reasons. Field names match the
     // qc_report.R `drop_labels` map exactly so the drop-reason bar renders each one; the report
     // sums EVERY scalar `dropped_*` field, so we deliberately do NOT also emit an aggregate
     // `dropped_no_barcode` (that would double-count).
@@ -136,7 +136,7 @@ fn qname(id: &[u8]) -> &[u8] {
 
 // count bases below `phred` in a quality slice (ASCII phred+33)
 fn low_bases(qual: &[u8], phred: u8) -> usize {
-    qual.iter().filter(|&&q| q.saturating_sub(33) < phred).count()
+    qual.iter().filter(|&&q| q.saturating_sub(crate::PHRED_OFFSET) < phred).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -315,8 +315,8 @@ enum DropKind {
 
 // Per-read decision produced by the pure, parallel `process`. Drops are split at the barcode
 // quality gate: `DropAfterBc` reads already passed barcode assignment, so the serial drain must
-// still count them into bc_exact/bc_corrected before recording the drop — matching the original
-// ordering. (`DropAfterBc` only ever carries ShortR2 / UmiQuality.)
+// still count them into bc_exact/bc_corrected before recording the drop. (`DropAfterBc` only
+// ever carries ShortR2 / UmiQuality.)
 enum Outcome {
     Drop(DropKind),
     DropAfterBc { corrected: bool, kind: DropKind },
@@ -371,9 +371,9 @@ fn process(q: &Quad, table: &IndexTable, params: &TrimParams, g: &Geometry, cfg:
         &bc_q_buf[..0] // len 0 -> passes the gate; never taken in practice
     };
 
-    // assign_into distinguishes the three no-barcode sub-reasons (§6): a genuine miss, an ambiguous
+    // assign_into distinguishes the three no-barcode sub-reasons: a genuine miss, an ambiguous
     // reject-sentinel window, and a decoded-but-unlisted pair. The per-worker `scratch` keeps the
-    // orientation-flip allocation off the hot path (§1). The interned label is borrowed, so it is
+    // orientation-flip allocation off the hot path. The interned label is borrowed, so it is
     // materialized into an owned `bc` only for a passing read.
     let (bc, corrected) = match table.assign_into(raw_i7, raw_i5, scratch) {
         AssignResult::Assigned { label, corrected, .. } => (label.to_string(), corrected),
@@ -549,7 +549,7 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
     table.detect_and_set_orientation(&i7_samples, &i5_samples)?;
     stage.step(format!("orientation i7={:?} i5={:?}", table.i7_orient, table.i5_orient));
 
-    // Thread knobs (§1): P = compress deflaters (ShardSet), N = filter-local rayon workers. At T<=1
+    // Thread knobs: P = compress deflaters (ShardSet), N = filter-local rayon workers. At T<=1
     // resolved_threads() returns the degenerate (1,1) budget and we take the single-threaded path
     // below (no reader threads, no rayon pool, single-threaded BGZF codec) so one working thread never
     // oversubscribes the lone core. The filter pool (T>1 only) is DISTINCT from the global rayon pool.
@@ -563,9 +563,8 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
         stage.step(format!("pipeline: {n} filter worker(s), {p} deflater(s), {n_shards} shard(s)"));
     }
 
-    // Lazy folder creation: the filtered/ dir is materialized at the stage's first write (§6).
     std::fs::create_dir_all(&filtered_dir).context("creating filtered/")?;
-    // compress_threads == 0 selects the single-threaded BGZF codec (§1).
+    // compress_threads == 0 selects the single-threaded BGZF codec.
     let codec_threads = if single { 0 } else { p };
     let mut shards = ShardSet::create(&filtered_dir, n_shards, &cfg.project, codec_threads, "quartsx filter")?;
     let mut qc = QcSampler::new();
@@ -573,7 +572,7 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
     stats.i7_orient = format!("{:?}", table.i7_orient);
     stats.i5_orient = format!("{:?}", table.i5_orient);
 
-    // Progress bar over COMPRESSED input bytes consumed (§1/§6) — replaces the 5 s printed counter.
+    // Progress bar over COMPRESSED input bytes consumed.
     let total_bytes: u64 = g
         .files
         .iter()
@@ -583,7 +582,7 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
     let progress = stage.progress_bytes(total_bytes);
 
     if single {
-        // Single-threaded path (§1): inflate the 4 inputs INLINE (no reader threads), classify + drain
+        // Single-threaded path: inflate the 4 inputs INLINE (no reader threads), classify + drain
         // each quad serially (no rayon pool), write via the single-threaded BGZF codec — so at T<=1
         // exactly one working thread runs. Output is byte-identical to the multithreaded path.
         let mut readers = Vec::with_capacity(4);
@@ -696,7 +695,7 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
     shards.finish()?;
     qc.write(Path::new(&cfg.star_tmp))?;
 
-    // Stats outputs (§6): JSON (kept) + a scalar TSV + a per-barcode TSV table.
+    // Stats outputs: JSON + a scalar TSV + a per-barcode TSV table.
     let json = serde_json::to_string_pretty(&stats).context("serializing filter stats")?;
     std::fs::write(filtered_dir.join("filter_stats.json"), json).context("writing filter_stats.json")?;
     // The filter stats table is QC output → write it into the run's qc/ folder, not filtered/.
@@ -708,7 +707,7 @@ pub fn filter(cfg: &Config, n_shards: usize, stage: &Stage) -> Result<FilterStat
     Ok(stats)
 }
 
-/// Scalar filter metrics as a two-column TSV alongside the JSON (§6).
+/// Scalar filter metrics as a two-column TSV alongside the JSON.
 fn write_stats_tsv(dir: &Path, s: &FilterStats) -> Result<()> {
     let f = File::create(dir.join("filter_stats.tsv")).context("creating filter_stats.tsv")?;
     let mut w = BufWriter::new(f);
@@ -737,7 +736,7 @@ fn write_stats_tsv(dir: &Path, s: &FilterStats) -> Result<()> {
     Ok(())
 }
 
-/// Per-barcode fragment table (§6). BTreeMap iteration is sorted → deterministic ordering.
+/// Per-barcode fragment table. BTreeMap iteration is sorted → deterministic ordering.
 fn write_per_barcode_tsv(dir: &Path, s: &FilterStats) -> Result<()> {
     let f = File::create(dir.join("filter_per_barcode.tsv")).context("creating filter_per_barcode.tsv")?;
     let mut w = BufWriter::new(f);
